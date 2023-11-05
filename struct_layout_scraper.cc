@@ -1,4 +1,5 @@
 #include <format>
+#include <iomanip>
 
 #include "log.hh"
 #include "struct_layout_scraper.hh"
@@ -9,39 +10,6 @@ namespace dwarf = llvm::dwarf;
 using FileLineInfoKind = llvm::DILineInfoSpecifier::FileLineInfoKind;
 
 namespace {
-
-/**
- * Helper to extract an unsigned long DIE attribute
- */
-std::optional<unsigned long> GetULongAttr(const llvm::DWARFDie &die,
-                                          dwarf::Attribute attr) {
-  if (auto opt = dwarf::toUnsigned(die.find(attr))) {
-    return *opt;
-  }
-  return std::nullopt;
-}
-
-std::optional<std::string> GetStrAttr(const llvm::DWARFDie &die,
-                                      dwarf::Attribute attr) {
-  if (auto opt = dwarf::toString(die.find(attr))) {
-    return *opt;
-  }
-  return std::nullopt;
-}
-
-std::string AnonymousName(const llvm::DWARFDie &die) {
-  std::string file = die.getDeclFile(FileLineInfoKind::AbsoluteFilePath);
-  unsigned long line = die.getDeclLine();
-  return std::format("<anon>@{}+{:d}", file, line);
-}
-
-llvm::DWARFDie FindFirstChild(const llvm::DWARFDie &die, dwarf::Tag tag) {
-  for (auto &child : die) {
-    if (child.getTag() == tag)
-      return child;
-  }
-  return llvm::DWARFDie();
-}
 
 } // namespace
 
@@ -60,7 +28,7 @@ void StructLayoutScraper::InitSchema() {
    * 2. Have the same size
    * 3. Are defined in the same file, at the same line.
    */
-  sm_.SqlExec("CREATE TABLE IF NOT EXISTS StructTypes ("
+  sm_.SqlExec("CREATE TABLE IF NOT EXISTS struct_type ("
               "id INTEGER NOT NULL PRIMARY KEY,"
               // File where the struct is defined
               "file text NOT NULL,"
@@ -89,7 +57,7 @@ void StructLayoutScraper::InitSchema() {
    * as for each member there is a single associated structure but a
    * structure may be associated to many members.
    */
-  sm_.SqlExec("CREATE TABLE IF NOT EXISTS StructMembers ("
+  sm_.SqlExec("CREATE TABLE IF NOT EXISTS struct_member ("
               "id INTEGER NOT NULL PRIMARY KEY,"
               // Index of the owning structure
               "owner int NOT NULL,"
@@ -114,8 +82,8 @@ void StructLayoutScraper::InitSchema() {
               // Type flags
               "flags int DEFAULT 0 NOT NULL,"
               "array_items int,"
-              "FOREIGN KEY (owner) REFERENCES StructTypes (id),"
-              "FOREIGN KEY (nested) REFERENCES StructTypes (id),"
+              "FOREIGN KEY (owner) REFERENCES struct_type (id),"
+              "FOREIGN KEY (nested) REFERENCES struct_type (id),"
               "UNIQUE(owner, name, offset))");
 }
 
@@ -167,18 +135,13 @@ bool StructLayoutScraper::VisitCommon(const llvm::DWARFDie &die,
   }
 
   StructTypeRow row;
+
   row.flags |= kind;
 
   /*
    * Need to extract the following in order to determine whether this is a
    * duplicate: (Name, File, Line, Size)
    */
-  std::string prefix;
-  if (kind == kTypeIsStruct)
-    prefix = "struct ";
-  else if (kind == kTypeIsUnion)
-    prefix = "union ";
-
   auto opt_size = dwarf::toUnsigned(die.find(dwarf::DW_AT_byte_size));
   if (!opt_size) {
     LOG(kWarn) << "Missing struct size for DIE @ 0x" << std::hex
@@ -197,7 +160,7 @@ bool StructLayoutScraper::VisitCommon(const llvm::DWARFDie &die,
     row.name = AnonymousName(die);
     row.flags |= kTypeIsAnonymous;
   }
-  row.c_name = prefix + row.name;
+  row.c_name = row.name;
 
   if (InsertStructLayout(row)) {
     /* Not a duplicate, we should go through the members */
@@ -216,6 +179,12 @@ void StructLayoutScraper::VisitMember(const llvm::DWARFDie &die,
   StructMemberRow member;
   member.line = die.getDeclLine();
   member.owner = row.id;
+  if (member.owner == 0) {
+    LOG(kError) << "Can not visit member of " << std::quoted(row.c_name) <<
+        " with invalid owner ID";
+    throw std::runtime_error("Invalid member owner ID");
+  }
+
 
   auto member_type_die = die.getAttributeValueAsReferencedDie(dwarf::DW_AT_type)
                              .resolveTypeUnitReference();
@@ -266,197 +235,44 @@ void StructLayoutScraper::VisitMember(const llvm::DWARFDie &die,
 
 std::optional<uint64_t> StructLayoutScraper::VisitMemberType(
     const llvm::DWARFDie &die, StructMemberRow &member) {
+  const auto record_type_mask = TypeInfoFlags::kTypeIsStruct |
+                                TypeInfoFlags::kTypeIsUnion |
+                                TypeInfoFlags::kTypeIsClass;
   /* Returned ID for the nested type, if any */
   std::optional<uint64_t> nested_type_id = std::nullopt;
-  /* Initialize member type to void */
-  member.type_name = "void";
-  member.byte_size = 0;
 
-  /* Collect the DIEs specifying the type in a chain */
-  std::vector<llvm::DWARFDie> chain;
-  llvm::DWARFDie next = die;
-  while (next) {
-    chain.push_back(next);
-    if (next.getTag() == dwarf::DW_TAG_structure_type ||
-        next.getTag() == dwarf::DW_TAG_class_type ||
-        next.getTag() == dwarf::DW_TAG_union_type ||
-        next.getTag() == dwarf::DW_TAG_subroutine_type ||
-        next.getTag() == dwarf::DW_TAG_enumeration_type ||
-        next.getTag() == dwarf::DW_TAG_base_type) {
-      break;
-    }
-    next = next.getAttributeValueAsReferencedDie(dwarf::DW_AT_type)
-           .resolveTypeUnitReference();
+  TypeInfo member_type = GetTypeInfo(die);
+
+  member.type_name = member_type.type_name;
+  member.byte_size = member_type.byte_size;
+  member.flags = member_type.flags;
+  member.array_items = member_type.array_items;
+
+  /*
+   * In this case, we want to reference the nested aggregate type,
+   * if this does not exist yet, we must create a placeholder for it
+   * in the database (this reserves the id essentially).
+   */
+  if ((member.flags & record_type_mask) != TypeInfoFlags::kTypeNone) {
+    StructTypeRow member_type_row;
+    member_type_row.name = member_type.decl_name.value();
+    member_type_row.size = member_type.byte_size;
+    member_type_row.file = member_type.decl_file.value();
+    member_type_row.line = member_type.decl_line.value();
+    member.nested = GetStructOrPlaceholder(member_type_row);
+    nested_type_id = member.nested;
   }
-
-  if (chain.size() == 0) {
-    LOG(kError) << "Failed to resolve type for member " <<
-        GetStrAttr(die, dwarf::DW_AT_name).value_or("<anonymous>");
-    throw std::runtime_error("Could not resolve type");
-  }
-  /* Walk the chain to evaluate the type definition */
-  for (auto iter_die = chain.rbegin(); iter_die != chain.rend(); ++iter_die) {
-    switch (iter_die->getTag()) {
-      case dwarf::DW_TAG_base_type: {
-        auto name = GetStrAttr(*iter_die, dwarf::DW_AT_name);
-        if (!name) {
-          LOG(kError) << "Found DW_TAG_base_type without a name";
-          throw std::runtime_error("Base type without a name");
-        }
-        auto size = GetULongAttr(*iter_die, dwarf::DW_AT_byte_size);
-        if (!size) {
-          LOG(kError) << "Found DW_TAG_base_type without a size";
-          throw std::runtime_error("Base type without a size");
-        }
-        member.type_name = *name;
-        member.byte_size = *size;
-        break;
-      }
-      case dwarf::DW_TAG_reference_type:
-      case dwarf::DW_TAG_rvalue_reference_type:
-      case dwarf::DW_TAG_pointer_type: {
-        if (iter_die->getTag() == dwarf::DW_TAG_reference_type) {
-          member.type_name += " &";
-        } else if (iter_die->getTag() == dwarf::DW_TAG_rvalue_reference_type) {
-          member.type_name += " &&";
-        } else {
-          member.type_name += " *";
-        }
-        member.byte_size = GetULongAttr(*iter_die, dwarf::DW_AT_byte_size).value_or(dwsrc_->GetABIPointerSize());
-        // Note, reset the flags because this is now a pointer
-        member.flags = kMemberIsPtr;
-        // Reset the nested value as this is a pointer now.
-        member.nested = std::nullopt;
-        break;
-      }
-      case dwarf::DW_TAG_const_type: {
-        member.type_name += " const";
-        member.flags |= kMemberIsConst;
-        break;
-      }
-      case dwarf::DW_TAG_volatile_type: {
-        member.type_name += " volatile";
-        break;
-      }
-      case dwarf::DW_TAG_array_type: {
-        llvm::DWARFDie subrange_die = FindFirstChild(*iter_die, dwarf::DW_TAG_subrange_type);
-        if (!subrange_die) {
-          LOG(kError) << "Found DW_TAG_array_type without a subrange DIE";
-          throw std::runtime_error("Array without subrange");
-        }
-        auto count = GetULongAttr(subrange_die, dwarf::DW_AT_count);
-        auto upper_bound = GetULongAttr(subrange_die, dwarf::DW_AT_upper_bound);
-        unsigned long array_items = 0;
-        if (count) {
-          array_items = *count;
-        } else if (upper_bound) {
-          array_items = *upper_bound + 1;
-        }
-        member.type_name += std::format(" [{:d}]", array_items);
-        member.array_items = array_items;
-        member.byte_size = member.byte_size * array_items;
-        member.flags |= kMemberIsArray;
-        // Reset the nested value as this is an array of structs now.
-        member.nested = std::nullopt;
-        break;
-      }
-      case dwarf::DW_TAG_subroutine_type: {
-        LOG(kWarn) << "TODO implement subroutine types";
-        break;
-      }
-      case dwarf::DW_TAG_typedef: {
-        auto name = GetStrAttr(*iter_die, dwarf::DW_AT_name);
-        if (!name) {
-          LOG(kError) << "Found DW_TAG_typedef without a name";
-          throw std::runtime_error("Typedef without a name");
-        }
-        // XXX should add an alias table
-        member.type_name = *name;
-        break;
-      }
-      case dwarf::DW_TAG_structure_type:
-      case dwarf::DW_TAG_class_type:
-      case dwarf::DW_TAG_union_type: {
-        /*
-         * In this case, we want to reference the nested aggregate type,
-         * if this does not exist yet, we must create a placeholder for it
-         * in the database (this reserves the id essentially).
-         */
-        auto name = GetStrAttr(*iter_die, dwarf::DW_AT_name)
-                    .value_or(AnonymousName(*iter_die));
-        if (iter_die->getTag() == dwarf::DW_TAG_structure_type)
-          member.type_name = "struct " + name;
-        else if (iter_die->getTag() == dwarf::DW_TAG_class_type)
-          member.type_name = "class " + name;
-        else
-          member.type_name = "union " + name;
-        // member.flags |= kMemberIsComposite;
-        if (iter_die->find(dwarf::DW_AT_declaration)) {
-          // XXX handle declarations, we need to reference a row with
-          // not enough information to uniquely identify it.
-          // Maybe we need to track compilation units?
-          LOG(kWarn) << "TODO support member type declarations";
-          break;
-        }
-        StructTypeRow target;
-        auto size = GetULongAttr(*iter_die, dwarf::DW_AT_byte_size);
-        if (!size) {
-          LOG(kError) << "Found aggregate type without size";
-          throw std::runtime_error("Aggregate type without size");
-        }
-        target.name = name;
-        target.size = *size;
-        target.file = iter_die->getDeclFile(FileLineInfoKind::AbsoluteFilePath);
-        target.line = iter_die->getDeclLine();
-        nested_type_id = GetStructOrPlaceholder(target);
-        member.nested = nested_type_id;
-        break;
-      }
-      case dwarf::DW_TAG_enumeration_type: {
-        auto name = GetStrAttr(*iter_die, dwarf::DW_AT_name)
-                    .value_or(AnonymousName(*iter_die));
-        member.type_name = "enum " + name;
-
-        if (iter_die->find(dwarf::DW_AT_declaration)) {
-          LOG(kWarn) << "TODO support enum member type declarations";
-          break;
-        }
-        auto size = GetULongAttr(*iter_die, dwarf::DW_AT_byte_size);
-        if (!size) {
-          LOG(kError) << "Found enum type without a size";
-          throw std::runtime_error("Enum type without a size");
-        }
-        member.byte_size = *size;
-        break;
-      }
-      default:
-        auto tag_name = dwarf::TagString(iter_die->getTag());
-        LOG(kError) << "Unhandled DIE " << tag_name.str();
-        throw std::runtime_error("Unhandled DIE");
-    }
-  }
-
   return nested_type_id;
-}
-
-bool StructLayoutScraper::LinkMemberToStruct(StructMemberRow &member,
-                                             StructTypeRow &row) {
-  LOG(kDebug) << "Link member " << member.name << " to " << row.name;
-  std::string q = std::format(
-      "");
-
-  sm_.Sql(q);
-  return true;
 }
 
 uint64_t StructLayoutScraper::GetStructOrPlaceholder(StructTypeRow &row) {
   std::optional<int64_t> id;
   std::string q = std::format(
-      "INSERT OR IGNORE INTO StructTypes (file, line, name, size) "
+      "INSERT OR IGNORE INTO struct_type (file, line, name, size) "
       "VALUES('{}', {}, '{}', {})",
       row.file, row.line, row.name, row.size);
   std::string s = std::format(
-      "SELECT id FROM StructTypes WHERE file='{}' AND line={} "
+      "SELECT id FROM struct_type WHERE file='{}' AND line={} "
       "AND name='{}' AND size={}",
       row.file, row.line, row.name, row.size);
 
@@ -479,14 +295,16 @@ bool StructLayoutScraper::InsertStructLayout(StructTypeRow &row) {
   LOG(kDebug) << "Insert layout row for " << row.c_name;
   bool new_entry = false;
   std::string q = std::format(
-      "INSERT INTO StructTypes (file, line, name, c_name, size, flags) "
-      "VALUES('{}', {}, '{}', '{}', {}, {}) "
-      "ON CONFLICT(file, line, name, size) DO NOTHING RETURNING id",
+      "INSERT INTO struct_type (file, line, name, c_name, size, flags) "
+      "VALUES('{0}', {1}, '{2}', '{3}', {4}, {5}) "
+      "ON CONFLICT(file, line, name, size) DO UPDATE SET "
+      "c_name = '{3}', flags = {5} RETURNING id",
       row.file, row.line, row.name, row.c_name, row.size,
       static_cast<int>(row.flags));
 
-  sm_.SqlExec(q, [&new_entry](SqlRowView row) {
-    LOG(kDebug) << "Insert layout with ID=" << *row.ExtractAt<size_t>("id");
+  sm_.SqlExec(q, [&new_entry, &row](SqlRowView result) {
+    row.id = *result.ExtractAt<decltype(row.id)>("id");
+    LOG(kDebug) << "Inserted layout with ID=" << row.id;
     new_entry = true;
     return false;
   });
@@ -494,20 +312,23 @@ bool StructLayoutScraper::InsertStructLayout(StructTypeRow &row) {
 }
 
 bool StructLayoutScraper::InsertStructMember(StructMemberRow &row) {
-  LOG(kDebug) << "Insert layout member for " << row.name;
+  LOG(kDebug) << "Insert layout member " << row.name <<
+      " of type " << row.type_name;
   bool new_entry = false;
   std::string q = std::format(
-      "INSERT INTO StructMembers (owner, name, type_name, line, size, "
+      "INSERT INTO struct_member (owner, nested, name, type_name, line, size, "
       "bit_size, offset, bit_offset, flags, array_items) "
-      "VALUES({}, '{}', '{}', {}, {}, {}, {}, {}, {}, {}) "
+      "VALUES({0}, {1}, '{2}', '{3}', {4}, {5}, {6}, {7}, {8}, {9}, {10}) "
       "ON CONFLICT(owner, name, offset) DO NOTHING RETURNING id",
-      row.owner, row.name, row.type_name, row.line, row.byte_size,
+      row.owner, row.nested ? std::to_string(*row.nested) : "NULL",
+      row.name, row.type_name, row.line, row.byte_size,
       row.bit_size.value_or(0), row.byte_offset,
       row.bit_offset.value_or(0), static_cast<int>(row.flags),
       row.array_items.value_or(0));
 
-  sm_.SqlExec(q, [&new_entry](SqlRowView row) {
-    LOG(kDebug) << "Insert member with ID=" << *row.ExtractAt<size_t>("id");
+  sm_.SqlExec(q, [&new_entry, &row](SqlRowView result) {
+    row.id = *result.ExtractAt<decltype(row.id)>("id");
+    LOG(kDebug) << "Inserted member with ID=" << row.id;
     new_entry = true;
     return false;
   });

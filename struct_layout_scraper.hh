@@ -9,11 +9,6 @@
 
 namespace cheri {
 
-template<typename T>
-struct EnumTraits {
-  static constexpr bool is_bitflag = false;
-};
-
 /**
  * Flags used in the StructTypes.flags table field
  * These signal the type of the aggregate and other
@@ -33,46 +28,11 @@ struct EnumTraits<StructTypeFlags> {
 };
 
 /**
- * Flags used in the StructMembers.flags table field
- * These flags signal type modifiers and kind.
- */
-enum StructMemberFlags {
-  kMemberNone = 0,
-  kMemberIsPtr = 1 << 1,
-  kMemberIsFnPtr = 1 << 2,
-  kMemberIsArray = 1 << 3,
-  kMemberIsConst = 1 << 4,
-  kMemberIsDecl = 1 << 5
-};
-
-template<>
-struct EnumTraits<StructMemberFlags> {
-  static constexpr bool is_bitflag = true;
-};
-
-template<typename T>
-concept BitFlagEnum = std::is_enum_v<T> && EnumTraits<T>::is_bitflag;
-
-template<BitFlagEnum T>
-T operator|(T &L, const T &R) {
-  return static_cast<T>(static_cast<int>(L) | static_cast<int>(R));
-}
-
-template<BitFlagEnum T>
-T operator&(T &L, const T &R) {
-  return static_cast<T>(static_cast<int>(L) & static_cast<int>(R));
-}
-
-template<BitFlagEnum T>
-T& operator|=(T &L, const T &R) {
-  L = L | R;
-  return L;
-}
-
-/**
  * Helper to hold the data for a row in the StructTypes table.
  */
 struct StructTypeRow {
+  StructTypeRow()
+      : id(0), line(0), size(0), flags(kTypeNone) {}
   uint64_t id;
   std::string file;
   unsigned long line;
@@ -87,17 +47,21 @@ struct StructTypeRow {
  * Helper to hold the data for a row in the StructMembers table
  */
 struct StructMemberRow {
+  StructMemberRow()
+      : id(0), owner(0), line(0), byte_size(0),
+        byte_offset(0), flags(TypeInfoFlags::kTypeNone) {}
   uint64_t id;
   uint64_t owner;
   std::optional<uint64_t> nested;
   std::string name;
+  // TypeInfo type_info;
   std::string type_name;
   unsigned long line;
   unsigned long byte_size;
   std::optional<unsigned char> bit_size;
   unsigned long byte_offset;
   std::optional<unsigned char> bit_offset;
-  StructMemberFlags flags;
+  TypeInfoFlags flags;
   std::optional<unsigned long> array_items;
 };
 
@@ -147,12 +111,6 @@ protected:
    */
   std::optional<uint64_t> VisitMemberType(const llvm::DWARFDie &die,
                                           StructMemberRow &member);
-
-  /**
-   * Associate a member to the structure entry corresponding to its type.
-   * If the member is not a structure-like type, this should not be called.
-   */
-  bool LinkMemberToStruct(StructMemberRow &member, StructTypeRow &row);
 
   /**
    * insert a new struct layout into the layouts table.

@@ -4,12 +4,14 @@
 #include <concepts>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <type_traits>
 
 #include <llvm/DebugInfo/DWARF/DWARFContext.h>
 #include <llvm/Object/Binary.h>
 
+#include "bit_flag_enum.hh"
 #include "storage.hh"
 
 namespace cheri {
@@ -46,6 +48,28 @@ bool VisitDispatch(S &scraper, llvm::DWARFDie &die)
 } /* namespace impl */
 
 /**
+ * Helper to extract an unsigned long DIE attribute
+ */
+std::optional<unsigned long> GetULongAttr(const llvm::DWARFDie &die,
+                                          llvm::dwarf::Attribute attr);
+/**
+ * Helper to extract a string DIE attribute
+ */
+std::optional<std::string> GetStrAttr(const llvm::DWARFDie &die,
+                                      llvm::dwarf::Attribute attr);
+
+/**
+ * Helper to find the first child DIE with a given tag.
+ */
+llvm::DWARFDie FindFirstChild(const llvm::DWARFDie &die, llvm::dwarf::Tag tag);
+
+/**
+ * Helper to build an unique anonymous name for a DIE.
+ * This is used to construct anonymous names of record types.
+ */
+std::string AnonymousName(const llvm::DWARFDie &die);
+
+/**
  * A shared DWARF object, possibly between multiple scrapers.
  */
 class DwarfSource {
@@ -80,6 +104,42 @@ struct ScrapeResult {
 };
 
 /**
+ * Flags used in the StructMembers.flags table field
+ * These flags signal type modifiers and kind.
+ */
+enum class TypeInfoFlags {
+  kTypeNone = 0,
+  kTypeIsPtr = 1,
+  kTypeIsFn = 1 << 1,
+  kTypeIsArray = 1 << 2,
+  kTypeIsDecl = 1 << 3,
+  kTypeIsStruct = 1 << 4,
+  kTypeIsUnion = 1 << 5,
+  kTypeIsClass = 1 << 6
+};
+
+template<>
+struct EnumTraits<TypeInfoFlags> {
+  static constexpr bool is_bitflag = true;
+};
+
+/**
+ * Common type information data.
+ * This can be extracted from a DIE with the DW_AT_type attribute.
+ */
+struct TypeInfo {
+  TypeInfo() : byte_size(0), flags(TypeInfoFlags::kTypeNone) {}
+
+  std::string type_name;
+  unsigned long byte_size;
+  TypeInfoFlags flags;
+  std::optional<unsigned long> array_items;
+  std::optional<std::string> decl_name;
+  std::optional<std::string> decl_file;
+  std::optional<unsigned long> decl_line;
+};
+
+/**
  * Main scraper interface.
  * Different scrapers collect set of information.
  *
@@ -110,6 +170,17 @@ public:
   virtual void InitSchema() = 0;
 
 protected:
+  /* Helper to resolve a type definition given a Die with a DW_AT_type attribute */
+  void GetTypeInfo(const llvm::DWARFDie &die, TypeInfo &info);
+
+  TypeInfo GetTypeInfo(const llvm::DWARFDie &die) {
+    TypeInfo info;
+
+    GetTypeInfo(die, info);
+    return info;
+  }
+
+
   /* Subclasses must implement this to properly invoke VisitDispatch */
   virtual bool DoVisit(llvm::DWARFDie &die) = 0;
 

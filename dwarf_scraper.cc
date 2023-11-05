@@ -23,6 +23,17 @@ namespace {
  */
 enum class ScraperID { StructLayout };
 
+std::ostream& operator<<(std::ostream &os, const ScraperID &value) {
+  switch (value) {
+    case ScraperID::StructLayout:
+      os << "struct-layout";
+      break;
+    default:
+      os << "<unknown-scraper>";
+  }
+  return os;
+}
+
 /**
  * Helper context for the scraping session
  */
@@ -55,19 +66,21 @@ MakeScraper(ScraperID id, ScrapeContext &ctx,
 
 void Scrape(ScrapeContext &ctx, fs::path target,
             std::vector<ScraperID> *scrapers) {
-  LOG(cheri::kInfo) << "Create DWARF scraping job for " << target;
+  using JobResult = std::optional<cheri::ScrapeResult>;
+  LOG(cheri::kInfo) << "Create DWARF scraping jobs for " << target;
 
   /* DWARF source is shared among all scrapers, which run concurrently */
   auto dwsrc = std::make_shared<cheri::DwarfSource>(target);
 
   for (auto id : *scrapers) {
     auto future = ctx.pool.Async(
-        [&ctx, dwsrc,
-         id](std::stop_token stop_tok) -> std::optional<cheri::ScrapeResult> {
+        [&ctx, dwsrc, id](std::stop_token stop_tok) -> JobResult {
           try {
             auto scr = MakeScraper(id, ctx, dwsrc);
             scr->InitSchema();
             scr->Extract(stop_tok);
+            LOG(cheri::kInfo) << "Scraper " << id << " completed job for " <<
+                dwsrc->GetPath().string();
             return scr->Result();
           } catch (std::exception &ex) {
             LOG(cheri::kError)
@@ -129,8 +142,7 @@ static cl::opt<bool> opt_stdin(
 static cl::list<std::string> opt_input(
     "input",
     cl::desc("Specify input file path(s)"),
-    cl::cat(cat_cheri_scraper),
-    cl::Required);
+    cl::cat(cat_cheri_scraper));
 static cl::alias alias_input(
     "i",
     cl::desc("Alias for --input"),
@@ -164,6 +176,11 @@ int main(int argc, char **argv) {
   LOG(cheri::kDebug) << "Initialize thread pool with " << opt_workers
                      << " workers";
   ScrapeContext ctx(opt_workers, fs::path(opt_database.c_str()));
+
+  if (!opt_stdin && opt_input.size() == 0) {
+    LOG(cheri::kError) << "At least one of --input or --stdin must be specified.";
+    cl::PrintHelpMessage();
+  }
 
   if (opt_stdin) {
     LOG(cheri::kDebug) << "Reading target files from STDIN";
