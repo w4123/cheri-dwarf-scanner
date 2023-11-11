@@ -90,6 +90,31 @@ private:
 };
 
 /**
+ * Helper object that maintains timing information for profiling.
+ */
+struct TimingInfo {
+  std::chrono::milliseconds avg;
+  unsigned long events;
+};
+
+/**
+ * Helper scope that extracts the timing of an event.
+ */
+class TimingScope {
+ public:
+  TimingScope(TimingInfo &ti) : ti_(ti), start_(std::chrono::steady_clock::now()) {}
+  ~TimingScope() {
+    auto end = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - start_);
+    ti_.avg = ((ti_.events * ti_.avg) + elapsed) / ++ti_.events;
+  }
+
+ private:
+  TimingInfo &ti_;
+  std::chrono::steady_clock::time_point start_;
+};
+
+/**
  * Scraper execution result.
  *
  * The result should contain statistics and metadata that can be used to
@@ -97,13 +122,20 @@ private:
  * This should not be used to pass heavy data, use the StorageManager instead.
  */
 struct ScrapeResult {
-  ScrapeResult() = default;
+  ScrapeResult() : dup_structs(0), dup_members(0) {}
   virtual ~ScrapeResult() = default;
 
+  TimingScope Timing(std::string_view name);
+
   std::filesystem::path source;
-  unsigned long processed_entries;
-  std::chrono::milliseconds elapsed_time;
+  std::unordered_map<std::string, TimingInfo> profile;
+  std::vector<std::string> errors;
+
+  unsigned long dup_structs;
+  unsigned long dup_members;
 };
+
+std::ostream& operator<<(std::ostream &os, const ScrapeResult &sr);
 
 /**
  * Flags used in the StructMembers.flags table field
@@ -114,7 +146,7 @@ enum class TypeInfoFlags {
   kTypeIsPtr = 1,
   kTypeIsFn = 1 << 1,
   kTypeIsArray = 1 << 2,
-  kTypeIsDecl = 1 << 3,
+  kTypeIsAnon = 1 << 3,
   kTypeIsStruct = 1 << 4,
   kTypeIsUnion = 1 << 5,
   kTypeIsClass = 1 << 6
@@ -136,6 +168,8 @@ struct TypeInfo {
   unsigned long byte_size;
   TypeInfoFlags flags;
   std::optional<unsigned long> array_items;
+  llvm::DWARFDie type_die;
+  // Drop these
   std::optional<std::string> decl_name;
   std::optional<std::string> decl_file;
   std::optional<unsigned long> decl_line;
@@ -196,8 +230,7 @@ protected:
   std::shared_ptr<const DwarfSource> dwsrc_;
 
   /* Statistics */
-  unsigned long processed_entries_;
-  std::chrono::milliseconds elapsed_time_;
+  ScrapeResult stats_;
 };
 
 } /* namespace cheri */

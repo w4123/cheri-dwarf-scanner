@@ -197,5 +197,11 @@ int main(int argc, char **argv) {
 
   ctx.pool.Join();
 
+  /* Report results */
+  for (auto &future_result : ctx.future_results) {
+    auto result = future_result.get().value();
+    LOG(cheri::kInfo) << result;
+  }
+
   return 0;
 }

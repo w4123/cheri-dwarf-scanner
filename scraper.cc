@@ -21,14 +21,48 @@ namespace dwarf = llvm::dwarf;
 
 namespace {
 
-template <typename CC>
+template<typename CC>
+struct CapTraits {};
+
+template<>
+struct CapTraits<CompressedCap128m> {
+  using CapType = typename CompressedCap128m::cap_t;
+  using AddrType = typename CompressedCap128m::addr_t;
+  static CapType& SetAddr(CapType& cap, AddrType cursor) {
+    cc128m_set_addr(&cap, cursor);
+    return cap;
+  }
+};
+
+template<>
+struct CapTraits<CompressedCap128> {
+  using CapType = typename CompressedCap128::cap_t;
+  using AddrType = typename CompressedCap128::addr_t;
+  static CapType& SetAddr(CapType& cap, AddrType cursor) {
+    cc128_set_addr(&cap, cursor);
+    return cap;
+  }
+};
+
+template<>
+struct CapTraits<CompressedCap64> {
+  using CapType = typename CompressedCap64::cap_t;
+  using AddrType = typename CompressedCap64::addr_t;
+  static CapType& SetAddr(CapType& cap, AddrType cursor) {
+    cc64_set_addr(&cap, cursor);
+    return cap;
+  }
+};
+
+template<typename CC>
 std::pair<uint64_t, uint64_t> FindRepresentableRangeImpl(uint64_t base,
                                                          uint64_t length) {
   using AddrT = typename CC::addr_t;
   using CheriCap = typename CC::cap_t;
 
   CheriCap cap =
-      CC::make_max_perms_cap(0, base, std::numeric_limits<AddrT>::max() + 1);
+      CC::make_max_perms_cap(0, 0, std::numeric_limits<AddrT>::max() + 1);
+  CapTraits<CC>::SetAddr(cap, base);
   bool exact = CC::setbounds(&cap, length);
   if (exact) {
     assert(cap.base() == base && "Invalid exact base?");
@@ -40,6 +74,20 @@ std::pair<uint64_t, uint64_t> FindRepresentableRangeImpl(uint64_t base,
 } // namespace
 
 namespace cheri {
+
+TimingScope ScrapeResult::Timing(std::string_view name) {
+  auto [entry, _] = profile.emplace(name, TimingInfo());
+  return TimingScope(entry->second);
+}
+
+std::ostream& operator<<(std::ostream &os, const ScrapeResult &sr) {
+  os << "Result for " << sr.source << ":";
+  for (auto &prof : sr.profile) {
+    os << " |" << prof.first << "> #" << prof.second.events <<
+        " avg:" << prof.second.avg;
+  }
+  return os;
+}
 
 std::optional<unsigned long> GetULongAttr(const llvm::DWARFDie &die,
                                           dwarf::Attribute attr) {
@@ -163,6 +211,7 @@ DwarfScraper::DwarfScraper(StorageManager &sm,
 void DwarfScraper::Extract(std::stop_token stop_tok) {
   auto &dictx = dwsrc_->GetContext();
 
+  auto timing = stats_.Timing("elapsed_time");
   for (auto &unit : dictx.info_section_units()) {
     if (stop_tok.stop_requested()) {
       break;
@@ -195,10 +244,8 @@ void DwarfScraper::Extract(std::stop_token stop_tok) {
 }
 
 ScrapeResult DwarfScraper::Result() {
-  ScrapeResult r;
+  ScrapeResult r(stats_);
   r.source = dwsrc_->GetPath();
-  r.processed_entries = processed_entries_;
-  r.elapsed_time = elapsed_time_;
 
   return r;
 }
@@ -231,6 +278,7 @@ void DwarfScraper::GetTypeInfo(const llvm::DWARFDie &die, TypeInfo &info) {
           throw std::runtime_error("Base type without a size");
         }
         info.byte_size = *size;
+        info.type_die = *iter_die;
         break;
       }
       case dwarf::DW_TAG_structure_type:
@@ -257,12 +305,16 @@ void DwarfScraper::GetTypeInfo(const llvm::DWARFDie &die, TypeInfo &info) {
            */
           break;
         }
+        if (!iter_die->find(dwarf::DW_AT_name)) {
+          info.flags |= TypeInfoFlags::kTypeIsAnon;
+        }
         auto size = GetULongAttr(*iter_die, dwarf::DW_AT_byte_size);
         if (!size) {
           LOG(kError) << "Found aggregate type without size";
           throw std::runtime_error("Aggregate type without size");
         }
         info.byte_size = *size;
+        info.type_die = *iter_die;
         break;
       }
       case dwarf::DW_TAG_enumeration_type: {
@@ -276,6 +328,7 @@ void DwarfScraper::GetTypeInfo(const llvm::DWARFDie &die, TypeInfo &info) {
           throw std::runtime_error("Enum type without a size");
         }
         info.byte_size = *size;
+        info.type_die = *iter_die;
         break;
       }
       case dwarf::DW_TAG_const_type:
@@ -314,6 +367,7 @@ void DwarfScraper::GetTypeInfo(const llvm::DWARFDie &die, TypeInfo &info) {
       }
       case dwarf::DW_TAG_subroutine_type: {
         info.flags |= TypeInfoFlags::kTypeIsFn;
+        info.type_die = *iter_die;
         break;
       }
       default:
@@ -321,6 +375,12 @@ void DwarfScraper::GetTypeInfo(const llvm::DWARFDie &die, TypeInfo &info) {
         LOG(kError) << "Unhandled DIE " << tag_name.str();
         throw std::runtime_error("Unhandled DIE");
     }
+  }
+
+  if ((info.flags & TypeInfoFlags::kTypeIsAnon) != TypeInfoFlags::kTypeNone) {
+    // Anonymous types must render the name according to our pattern
+    info.type_name = std::format("<anon>@{}+{:d}", info.decl_file.value(),
+                                 info.decl_line.value());
   }
 }
 

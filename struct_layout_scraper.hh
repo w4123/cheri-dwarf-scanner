@@ -3,7 +3,9 @@
 
 #include <concepts>
 #include <optional>
+#include <set>
 #include <string>
+#include <unordered_map>
 
 #include "scraper.hh"
 
@@ -14,7 +16,7 @@ namespace cheri {
  * These signal the type of the aggregate and other
  * boolean metadata.
  */
-enum StructTypeFlags {
+enum class StructTypeFlags {
   kTypeNone = 0,
   kTypeIsAnonymous = 1,
   kTypeIsStruct = 1 << 1,
@@ -31,13 +33,17 @@ struct EnumTraits<StructTypeFlags> {
  * Helper to hold the data for a row in the struct_types table.
  */
 struct StructTypeRow {
+  /**
+   * Construct the type row from an SQL result view.
+   */
+  static StructTypeRow FromSql(SqlRowView view);
+
   StructTypeRow()
-      : id(0), line(0), size(0), flags(kTypeNone) {}
+      : id(0), line(0), size(0), flags(StructTypeFlags::kTypeNone) {}
   uint64_t id;
   std::string file;
   unsigned long line;
   std::string name;
-  std::string c_name;
   uint64_t size;
   StructTypeFlags flags;
 };
@@ -46,6 +52,11 @@ struct StructTypeRow {
  * Helper to hold the data for a row in the struct_members table.
  */
 struct StructMemberRow {
+  /**
+   * Construct the member row from an SQL result view.
+   */
+  static StructMemberRow FromSql(SqlRowView view);
+
   StructMemberRow()
       : id(0), owner(0), line(0), byte_size(0),
         byte_offset(0), flags(TypeInfoFlags::kTypeNone) {}
@@ -53,7 +64,6 @@ struct StructMemberRow {
   uint64_t owner;
   std::optional<uint64_t> nested;
   std::string name;
-  // TypeInfo type_info;
   std::string type_name;
   unsigned long line;
   unsigned long byte_size;
@@ -64,12 +74,15 @@ struct StructMemberRow {
   std::optional<unsigned long> array_items;
 };
 
+std::ostream& operator<<(std::ostream &os, const StructMemberRow &row);
+
 /**
  * Helper to hold the data for a row in the member_bounds table.
  */
 struct MemberBoundsRow {
   uint64_t owner;
   uint64_t member;
+  std::string name;
   uint64_t offset;
   uint64_t base;
   uint64_t top;
@@ -108,13 +121,17 @@ protected:
   }
   /**
    * Common visitor logic for all aggregate types.
+   * Returns the ID of the struct_type entry corresponding to the DIE.
+   * If processing failed for some reason, the ID may not be valid.
    */
-  bool VisitCommon(const llvm::DWARFDie &die, StructTypeFlags kind);
+  std::optional<int64_t> VisitCommon(const llvm::DWARFDie &die,
+                                     StructTypeFlags kind);
 
   /**
    * Visit a structure/union/class member DIE
    */
-  void VisitMember(const llvm::DWARFDie &die, const StructTypeRow &row);
+  void VisitMember(const llvm::DWARFDie &die, const StructTypeRow &row,
+                   int member_index);
 
   /**
    * Visit the DIE chain for a structure member type.
@@ -123,35 +140,44 @@ protected:
                                           StructMemberRow &member);
 
   /**
-   * Compute the sub-object member capability and create a corresponding
-   * entry into the member_bounds table.
+   * Compute sub-object member capabilities for all nested members of
+   * a given type. The type is assumed to have been fully evaluated
+   * and we have DB entries for all nested members.
    */
-  void ComputeMemberSubobjectCapability(const StructMemberRow &row);
+  void FindSubobjectCapabilities(int64_t struct_type_id);
 
   /**
    * Insert a new struct layout into the layouts table.
    * Returns true if a new row was inserted.
    */
-  bool InsertStructLayout(StructTypeRow &row);
-
-  /**
-   * Find a matching struct layout given a possibly incomplete row.
-   * This creates a placeholder entry if the struct is not present yet.
-   * The input row specifier must have at least the (name, file, line, size)
-   * fields.
-   */
-  uint64_t GetStructOrPlaceholder(StructTypeRow &row);
+  bool InsertStructLayout(const llvm::DWARFDie &die, StructTypeRow &row);
 
   /**
    * Insert a new struct member into the members table.
    * Returns true if a new row was inserted.
    */
-  bool InsertStructMember(StructMemberRow &row);
+  void InsertStructMember(StructMemberRow &row);
 
   /**
    * Insert a new record in the member_bounds table.
    */
   void InsertMemberBounds(const MemberBoundsRow &row);
+
+  /**
+   * Cache DIE offsets to struct_type indices.
+   */
+  std::unordered_map<uint64_t, int64_t> struct_type_cache_;
+
+  /**
+   * Pre-compiled queries for InsertStructLayout.
+   */
+  std::unique_ptr<SqlQuery> insert_struct_query_;
+  std::unique_ptr<SqlQuery> select_struct_query_;
+
+  /**
+   * Pre-compiled queries for InsertStructMember.
+   */
+  std::unique_ptr<SqlQuery> insert_member_query_;
 };
 
 } /* namespace cheri */
