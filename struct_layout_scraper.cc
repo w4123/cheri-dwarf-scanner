@@ -326,15 +326,13 @@ StructLayoutScraper::VisitCommon(const llvm::DWARFDie &die,
   if (InsertStructLayout(die, row)) {
     // Not a duplicate, we must collect the members
     int member_index = 0;
-    // std::vector<StructMemberRow> member_entries;
+    std::vector<StructMemberRow> m_rows;
     for (auto &child : die.children()) {
       if (child.getTag() == dwarf::DW_TAG_member) {
-        VisitMember(child, row, member_index++);
+        m_rows.emplace_back(VisitMember(child, row, member_index++));
       }
     }
-    // Batch-insert member entries
-    // BatchInsertStructMembers(member_entries);
-
+    InsertStructMembers(m_rows);
     // Recursion guarantees that the layout is complete here.
     // Proceed to inspect the flattened layout.
   }
@@ -342,9 +340,9 @@ StructLayoutScraper::VisitCommon(const llvm::DWARFDie &die,
   return row.id;
 }
 
-void StructLayoutScraper::VisitMember(const llvm::DWARFDie &die,
-                                      const StructTypeRow &row,
-                                      int member_index) {
+StructMemberRow StructLayoutScraper::VisitMember(const llvm::DWARFDie &die,
+                                                 const StructTypeRow &row,
+                                                 int member_index) {
   StructMemberRow member;
   member.line = die.getDeclLine();
   member.owner = row.id;
@@ -403,9 +401,7 @@ void StructLayoutScraper::VisitMember(const llvm::DWARFDie &die,
   }
   member.name = GetStrAttr(die, dwarf::DW_AT_name).value_or(name);
 
-  InsertStructMember(member);
-  LOG(kDebug) << "Insert layout member " << member.name << " of type "
-              << member.type_name << " ID=" << member.id;
+  return member;
 }
 
 std::optional<uint64_t>
@@ -474,9 +470,9 @@ bool StructLayoutScraper::InsertStructLayout(const llvm::DWARFDie &die,
 
   bool new_entry = false;
   auto timing = stats_.Timing("insert_type");
-  insert_struct_query_->TakeCursor();
-  insert_struct_query_->Bind(row.file, row.line, row.name, row.size, row.flags);
-  insert_struct_query_->Run([&new_entry, &row](SqlRowView result) {
+  auto cursor = insert_struct_query_->TakeCursor();
+  cursor.Bind(row.file, row.line, row.name, row.size, row.flags);
+  cursor.Run([&new_entry, &row](SqlRowView result) {
     result.Fetch("id", row.id);
     LOG(kDebug) << "Insert record type for " << row.name << " at " << row.file
                 << ":" << row.line << " with ID=" << row.id;
@@ -487,9 +483,9 @@ bool StructLayoutScraper::InsertStructLayout(const llvm::DWARFDie &die,
   if (!new_entry) {
     // Need to extract the ID from the database
     // XXX this may be done lazily maybe? as we do not always use it.
-    select_struct_query_->TakeCursor();
-    select_struct_query_->Bind(row.file, row.line, row.name);
-    select_struct_query_->Run([&row](SqlRowView result) {
+    auto cursor = select_struct_query_->TakeCursor();
+    cursor.Bind(row.file, row.line, row.name);
+    cursor.Run([&row](SqlRowView result) {
       result.Fetch("id", row.id);
       return true;
     });
@@ -505,46 +501,44 @@ bool StructLayoutScraper::InsertStructLayout(const llvm::DWARFDie &die,
  * yet. Concurrent member generation should not occur, therefore we
  * expect the INSERT to succeed.
  */
-void StructLayoutScraper::InsertStructMember(StructMemberRow &row) {
-  std::optional<int64_t> member_id;
+void StructLayoutScraper::InsertStructMembers(
+    std::vector<StructMemberRow> &member_rows) {
 
   auto timing = stats_.Timing("insert_member");
-  insert_member_query_->TakeCursor();
-  insert_member_query_->BindAt("@owner", row.owner);
-  insert_member_query_->BindAt("@nested", row.nested);
-  insert_member_query_->BindAt("@name", row.name);
-  insert_member_query_->BindAt("@type_name", row.type_name);
-  insert_member_query_->BindAt("@line", row.line);
-  insert_member_query_->BindAt("@size", row.byte_size);
-  insert_member_query_->BindAt("@bit_size", row.bit_size);
-  insert_member_query_->BindAt("@offset", row.byte_offset);
-  insert_member_query_->BindAt("@bit_offset", row.bit_offset);
-  insert_member_query_->BindAt("@flags", row.flags);
-  insert_member_query_->BindAt("@array_items", row.array_items);
-  try {
-    insert_member_query_->Run([&member_id](SqlRowView result) {
-      result.Fetch("id", member_id);
-      return false;
-    });
-  } catch (const std::exception &ex) {
-    StructMemberRow existing;
-    sm_.SqlExec(std::format("SELECT * FROM struct_member WHERE owner={} AND "
-                            "name='{}' AND offset={}",
-                            row.owner, row.name, row.byte_offset),
-                [&existing](SqlRowView result) {
-                  existing = StructMemberRow::FromSql(result);
-                  return true;
-                });
-    LOG(kError) << "Failed to insert struct member " << row << " found "
-                << existing;
-    throw;
+  auto cursor = insert_member_query_->TakeCursor();
+  auto tx = sm_.BeginTransaction();
+  for (auto &row : member_rows) {
+    cursor.BindAt("@owner", row.owner);
+    cursor.BindAt("@nested", row.nested);
+    cursor.BindAt("@name", row.name);
+    cursor.BindAt("@type_name", row.type_name);
+    cursor.BindAt("@line", row.line);
+    cursor.BindAt("@size", row.byte_size);
+    cursor.BindAt("@bit_size", row.bit_size);
+    cursor.BindAt("@offset", row.byte_offset);
+    cursor.BindAt("@bit_offset", row.bit_offset);
+    cursor.BindAt("@flags", row.flags);
+    cursor.BindAt("@array_items", row.array_items);
+    try {
+      cursor.Run([&row](SqlRowView result) {
+        result.Fetch("id", row.id);
+        return true;
+      });
+    } catch (const std::exception &ex) {
+      StructMemberRow existing;
+      sm_.SqlExec(std::format("SELECT * FROM struct_member WHERE owner={} AND "
+                              "name='{}' AND offset={}",
+                              row.owner, row.name, row.byte_offset),
+                  [&existing](SqlRowView result) {
+                    existing = StructMemberRow::FromSql(result);
+                    return true;
+                  });
+      LOG(kError) << "Failed to insert struct member " << row << " found "
+                  << existing;
+      throw;
+    }
   }
-  if (!member_id) {
-    LOG(kError) << "No row returned by struct member insert for " << row.name
-                << "owner=" << row.owner;
-    throw std::runtime_error("Invalid struct member insert");
-  }
-  row.id = *member_id;
+  tx.Commit();
 }
 
 void StructLayoutScraper::InsertMemberBounds(const MemberBoundsRow &row) {

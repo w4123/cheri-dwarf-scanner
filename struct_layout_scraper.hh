@@ -129,8 +129,8 @@ protected:
   /**
    * Visit a structure/union/class member DIE
    */
-  void VisitMember(const llvm::DWARFDie &die, const StructTypeRow &row,
-                   int member_index);
+  StructMemberRow VisitMember(const llvm::DWARFDie &die,
+                              const StructTypeRow &row, int member_index);
 
   /**
    * Visit the DIE chain for a structure member type.
@@ -155,7 +155,7 @@ protected:
    * Insert a new struct member into the members table.
    * Returns true if a new row was inserted.
    */
-  void InsertStructMember(StructMemberRow &row);
+  void InsertStructMembers(std::vector<StructMemberRow> &rows);
 
   /**
    * Insert a new record in the member_bounds table.

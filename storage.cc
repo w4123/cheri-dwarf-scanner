@@ -50,97 +50,91 @@ private:
 namespace cheri {
 
 /**
- * Internal query state.
- * This is shared between the row views and the query.
+ * Shared cursor state between the query object, the cursor and the
+ * row views produced by the cursor.
  */
-struct QueryCursor {
-  QueryCursor(sqlite3_stmt *stmt) : stmt(stmt), version(0) {}
-
-  /**
-   * Relinquish the borrowed statement object.
-   * This will invalidate future uses of the cursor.
-   */
-  void Close() {
-    version++;
-    stmt = nullptr;
-  }
+struct QueryCursorState {
+  QueryCursorState(sqlite3_stmt *stmt) : active(true), index(0), stmt(stmt) {}
 
   /**
    * Advance the cursor to the next element.
    */
   bool Next() {
+    if (!active) {
+      LOG(kError) << "Attempt to advance detached cursor";
+      throw std::runtime_error("Invalid cursor state");
+    }
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
-      version++;
+      index++;
       return true;
     } else if (rc == SQLITE_DONE) {
-      version++;
+      index++;
       return false;
     } else {
       throw StorageException(rc, sqlite3_errstr(rc));
     }
   }
 
-  // atomic?
-  size_t version;
+  bool active;
+  size_t index;
   sqlite3_stmt *stmt;
 };
 
-SqlRowView::SqlRowView(std::weak_ptr<QueryCursor> cursor, size_t version)
-    : cursor_(cursor), version_(version) {}
+/*
+ * Sql query result view implementation.
+ */
+SqlRowView::SqlRowView(std::weak_ptr<QueryCursorState> state, size_t version)
+    : state_(state), version_(version) {}
 
-size_t SqlRowView::Size() const {
-  std::shared_ptr<QueryCursor> qc = cursor_.lock();
-  if (!qc || qc->version != version_) {
+std::shared_ptr<QueryCursorState> SqlRowView::LockState() const {
+  auto state = state_.lock();
+  if (!state || !state->active || state->index != version_) {
     LOG(kError) << "Attempted to use stale SqlRowView";
     throw std::out_of_range("Stale row view");
   }
-  return sqlite3_data_count(qc->stmt);
+  return state;
+}
+
+size_t SqlRowView::Size() const {
+  auto state = LockState();
+  return sqlite3_data_count(state->stmt);
 }
 
 std::vector<std::string> SqlRowView::Columns() const {
-  std::shared_ptr<QueryCursor> qc = cursor_.lock();
-  if (!qc || qc->version != version_) {
-    LOG(kError) << "Attempted to use stale SqlRowView";
-    throw std::out_of_range("Stale row view");
-  }
-
+  auto state = LockState();
   std::vector<std::string> cols;
-  for (size_t i = 0; i < sqlite3_data_count(qc->stmt); ++i) {
-    cols.emplace_back(sqlite3_column_name(qc->stmt, i));
+  for (size_t i = 0; i < sqlite3_data_count(state->stmt); ++i) {
+    cols.emplace_back(sqlite3_column_name(state->stmt, i));
   }
   return cols;
 }
 
 SqlValue SqlRowView::ValueAt(std::string column) const {
-  std::shared_ptr<QueryCursor> qc = cursor_.lock();
-  if (!qc || qc->version != version_) {
-    LOG(kError) << "Attempted to use stale SqlRowView";
-    throw std::out_of_range("Stale row view");
-  }
+  auto state = LockState();
 
-  for (size_t i = 0; i < sqlite3_data_count(qc->stmt); ++i) {
-    std::string name(sqlite3_column_name(qc->stmt, i));
+  for (size_t i = 0; i < sqlite3_data_count(state->stmt); ++i) {
+    std::string name(sqlite3_column_name(state->stmt, i));
     if (name != column) {
       continue;
     }
 
-    switch (sqlite3_column_type(qc->stmt, i)) {
+    switch (sqlite3_column_type(state->stmt, i)) {
     case SQLITE_INTEGER:
-      return sqlite3_column_int64(qc->stmt, i);
+      return sqlite3_column_int64(state->stmt, i);
     case SQLITE_FLOAT:
-      return sqlite3_column_double(qc->stmt, i);
+      return sqlite3_column_double(state->stmt, i);
     case SQLITE_BLOB: {
-      size_t bytes = sqlite3_column_bytes(qc->stmt, i);
+      size_t bytes = sqlite3_column_bytes(state->stmt, i);
       const std::byte *blob =
-          static_cast<const std::byte *>(sqlite3_column_blob(qc->stmt, i));
+          static_cast<const std::byte *>(sqlite3_column_blob(state->stmt, i));
       return std::vector<std::byte>(blob, blob + bytes);
     }
     case SQLITE_NULL:
       return std::monostate{};
     case SQLITE_TEXT:
       return std::string(
-          reinterpret_cast<const char *>(sqlite3_column_text(qc->stmt, i)));
+          reinterpret_cast<const char *>(sqlite3_column_text(state->stmt, i)));
     default:
       LOG(kError) << "Unhandled sqlite data type for column "
                   << std::quoted(name);
@@ -151,6 +145,147 @@ SqlValue SqlRowView::ValueAt(std::string column) const {
   throw std::runtime_error("Invalid column name");
 }
 
+/*
+ * Sql query cursor implementation.
+ */
+SqlQueryCursor::SqlQueryCursor(std::weak_ptr<QueryCursorState> state)
+    : state_(state) {}
+
+SqlQueryCursor::SqlQueryCursor(SqlQueryCursor &&other)
+    : state_(std::move(other.state_)) {}
+
+SqlQueryCursor::~SqlQueryCursor() {
+  auto state = state_.lock();
+  if (state) {
+    // Invalidate the state to signal we are done.
+    state->active = false;
+    state->index++;
+    state->stmt = nullptr;
+  }
+}
+
+std::shared_ptr<QueryCursorState> SqlQueryCursor::LockState() {
+  auto state = state_.lock();
+  if (!state) {
+    LOG(kError) << "Cursor is disassociated from query, use after free?";
+    throw std::runtime_error("Invalid cursor state");
+  }
+  if (!state->active) {
+    LOG(kError) << "Expired cursor can not run queries";
+    throw std::runtime_error("Invalid cursor state");
+  }
+  return state;
+}
+
+void SqlQueryCursor::Run(SqlQueryCursor::SqlCallback callback) {
+  auto state = LockState();
+
+  try {
+    while (state->Next()) {
+      if (callback) {
+        try {
+          if (callback(SqlRowView(state, state->index)))
+            break;
+        } catch (const std::exception &ex) {
+          LOG(kError) << "Failed to execute query callback: " << ex.what();
+          throw;
+        }
+      }
+    }
+  } catch (const std::exception &ex) {
+    LOG(kError) << "Failed to execute sql query: " << sqlite3_sql(state->stmt)
+                << " reason: " << ex.what();
+    throw;
+  }
+  // Reset the cursor state on success
+  Reset();
+}
+
+void SqlQueryCursor::Reset() {
+  auto state = LockState();
+  sqlite3_reset(state->stmt);
+  sqlite3_clear_bindings(state->stmt);
+  state->index++;
+}
+
+void SqlQueryCursor::CheckBind(std::shared_ptr<QueryCursorState> state,
+                               int pos) {
+  if (pos < 1 || pos > sqlite3_bind_parameter_count(state->stmt)) {
+    LOG(kError) << "Can not bind query value at position " << pos
+                << " for query " << sqlite3_sql(state->stmt);
+    throw std::invalid_argument(
+        "Can not bind query argument, invalid position");
+  }
+}
+
+void SqlQueryCursor::BindAt(int pos, int64_t value) {
+  auto state = LockState();
+  CheckBind(state, pos);
+  sqlite3_bind_int64(state->stmt, pos, value);
+}
+
+void SqlQueryCursor::BindAt(int pos, double value) {
+  auto state = LockState();
+  CheckBind(state, pos);
+  sqlite3_bind_double(state->stmt, pos, value);
+}
+
+void SqlQueryCursor::BindAt(int pos, std::string &value) {
+  auto state = LockState();
+  CheckBind(state, pos);
+  sqlite3_bind_text(state->stmt, pos, value.data(), value.size(),
+                    SQLITE_STATIC);
+}
+
+void SqlQueryCursor::BindAt(int pos, std::string &&value) {
+  auto state = LockState();
+  CheckBind(state, pos);
+  sqlite3_bind_text(state->stmt, pos, value.data(), value.size(),
+                    SQLITE_TRANSIENT);
+}
+
+void SqlQueryCursor::BindAt(int pos, std::vector<std::byte> &value) {
+  auto state = LockState();
+  CheckBind(state, pos);
+  sqlite3_bind_blob(state->stmt, pos, value.data(), value.size(),
+                    SQLITE_STATIC);
+}
+
+void SqlQueryCursor::BindAt(int pos, std::vector<std::byte> &&value) {
+  auto state = LockState();
+  CheckBind(state, pos);
+  sqlite3_bind_blob(state->stmt, pos, value.data(), value.size(),
+                    SQLITE_TRANSIENT);
+}
+
+void SqlQueryCursor::BindAt(int pos, std::monostate _) {
+  auto state = LockState();
+  CheckBind(state, pos);
+  sqlite3_bind_null(state->stmt, pos);
+}
+
+int SqlQueryCursor::BindPositionFor(std::shared_ptr<QueryCursorState> state,
+                                    const std::string &param) {
+  int index = sqlite3_bind_parameter_index(state->stmt, param.c_str());
+  if (index == 0) {
+    LOG(kError) << "Can not bind query value for " << std::quoted(param)
+                << ", the parameter name does not exist in query "
+                << sqlite3_sql(state->stmt) << " Available parameter names are "
+                << Join(GetBindNames(state));
+    throw std::invalid_argument("Can not bind query argument, invalid name");
+  }
+  return index;
+}
+
+std::vector<std::string>
+SqlQueryCursor::GetBindNames(std::shared_ptr<QueryCursorState> state) {
+  std::vector<std::string> names;
+  for (int i = 1; i < sqlite3_bind_parameter_count(state->stmt); i++) {
+    names.emplace_back(sqlite3_bind_parameter_name(state->stmt, i));
+  }
+  return names;
+}
+
 /**
  * Wrapper for a database query cursor.
  *
@@ -159,139 +294,37 @@ SqlValue SqlRowView::ValueAt(std::string column) const {
 class SqlQueryImpl : public SqlQuery {
 public:
   SqlQueryImpl(std::shared_ptr<DbConn> conn, std::string query)
-      : SqlQuery(query), conn_(conn) {
-    int rc = sqlite3_prepare_v2(conn->Get(), query.c_str(), query.size(),
+      : SqlQuery(std::move(query)), conn_(conn) {
+    int rc = sqlite3_prepare_v2(conn->Get(), query_.c_str(), query_.size(),
                                 &stmt_, nullptr);
     if (rc != SQLITE_OK) {
-      LOG(kError) << "Could not compile SQL query: " << query
+      LOG(kError) << "Could not compile SQL query: " << query_
                   << " error: " << sqlite3_errmsg(conn->Get());
       throw StorageException(rc, sqlite3_errstr(rc));
     }
-    TakeCursor();
   }
 
   ~SqlQueryImpl() {
     if (cursor_) {
-      cursor_->Close();
+      cursor_->active = false;
+      cursor_->stmt = nullptr;
     }
     sqlite3_finalize(stmt_);
   }
 
-  /**
-   * Build a view token for the current cursor.
-   */
-  SqlRowView GetRow() { return SqlRowView(cursor_, cursor_->version); }
-
-  void Run(SqlCallback callback) override {
-    if (!cursor_ || cursor_->version != 0) {
-      LOG(kError)
-          << "Can not run query with invalid cursor, "
-          << "must call TakeCursor() first to take ownership of the cursor.";
-      throw std::runtime_error("Invalid query state");
+  SqlQueryCursor TakeCursor() override {
+    if (cursor_ && cursor_->active) {
+      // Busy cursor state, fail
+      LOG(kError) << "Cursor is busy for query " << this->query_;
+      throw std::runtime_error("Attempted to acquire busy cursor");
     }
-
-    try {
-      while (cursor_->Next()) {
-        if (callback) {
-          try {
-            if (callback(SqlRowView(cursor_, cursor_->version)))
-              break;
-          } catch (const std::exception &ex) {
-            LOG(kError) << "Failed to execute query callback: " << ex.what();
-            throw;
-          }
-        }
-      }
-    } catch (const std::exception &ex) {
-      LOG(kError) << "Failed to execute sql query: " << query_
-                  << " reason: " << ex.what();
-      throw;
-    }
-    // Reset the cursor state
-    TakeCursor();
-  }
-
-  void BindAt(int pos, int64_t value) override {
-    CheckBind(pos);
-    sqlite3_bind_int64(stmt_, pos, value);
-  }
-
-  void BindAt(int pos, double value) override {
-    CheckBind(pos);
-    sqlite3_bind_double(stmt_, pos, value);
-  }
-
-  void BindAt(int pos, std::string &value) override {
-    CheckBind(pos);
-    sqlite3_bind_text(stmt_, pos, value.data(), value.size(), SQLITE_STATIC);
-  }
-
-  void BindAt(int pos, std::string &&value) override {
-    CheckBind(pos);
-    sqlite3_bind_text(stmt_, pos, value.data(), value.size(), SQLITE_TRANSIENT);
-  }
-
-  void BindAt(int pos, std::vector<std::byte> &value) override {
-    CheckBind(pos);
-    sqlite3_bind_blob(stmt_, pos, value.data(), value.size(), SQLITE_STATIC);
-  }
-
-  void BindAt(int pos, std::vector<std::byte> &&value) override {
-    CheckBind(pos);
-    sqlite3_bind_blob(stmt_, pos, value.data(), value.size(), SQLITE_TRANSIENT);
-  }
-
-  void BindAt(int pos, std::monostate _) override {
-    CheckBind(pos);
-    sqlite3_bind_null(stmt_, pos);
-  }
-
-  int BindPositionFor(const std::string &param) override {
-    int index = sqlite3_bind_parameter_index(stmt_, param.c_str());
-    if (index == 0) {
-      LOG(kError) << "Can not bind query value for " << std::quoted(param)
-                  << ", the parameter name does not exist in query "
-                  << this->query_ << " Available parameter names are "
-                  << Join(GetBindNames());
-      throw std::invalid_argument("Can not bind query argument, invalid name");
-    }
-    return index;
-  }
-
-  void TakeCursor() override {
-    if (cursor_) {
-      cursor_->Close();
-    }
-    sqlite3_reset(stmt_);
-    sqlite3_clear_bindings(stmt_);
-    cursor_ = std::make_shared<QueryCursor>(stmt_);
+    cursor_ = std::make_shared<QueryCursorState>(stmt_);
+    return SqlQueryCursor(cursor_);
   }
 
 private:
-  std::vector<std::string> GetBindNames() {
-    std::vector<std::string> names;
-    for (int i = 1; i < sqlite3_bind_parameter_count(stmt_); i++) {
-      names.emplace_back(sqlite3_bind_parameter_name(stmt_, i));
-    }
-    return names;
-  }
-
-  void CheckBind(int pos) {
-    if (!cursor_ || cursor_->version != 0) {
-      LOG(kError) << "Must take the cursor in order to bind statement "
-                  << "parameters";
-      throw std::runtime_error("Invalid query state");
-    }
-    if (pos < 1 || pos > sqlite3_bind_parameter_count(stmt_)) {
-      LOG(kError) << "Can not bind query value at position " << pos
-                  << " for query " << this->query_;
-      throw std::invalid_argument(
-          "Can not bind query argument, invalid position");
-    }
-  }
-
   sqlite3_stmt *stmt_;
-  std::shared_ptr<QueryCursor> cursor_;
+  std::shared_ptr<QueryCursorState> cursor_;
   std::shared_ptr<DbConn> conn_;
 };
 
@@ -302,20 +335,67 @@ class StorageManager::StorageManagerImpl {
 public:
   StorageManagerImpl(fs::path db_path) {
     db_ = std::make_shared<DbConn>(db_path);
+    active_transaction_ = false;
 
     /* Initialize the database if necessary */
-    Sql("CREATE TABLE IF NOT EXISTS Jobs ("
-        "id int NOT NULL PRIMARY KEY,"
-        "name varchar(255) NOT NULL)");
+    int rc = sqlite3_exec(db_->Get(),
+                          "CREATE TABLE IF NOT EXISTS jobs ("
+                          "id int NOT NULL PRIMARY KEY,"
+                          "name varchar(255) NOT NULL)",
+                          nullptr, nullptr, nullptr);
+    if (rc != SQLITE_OK) {
+      LOG(kError) << "Failed to create 'jobs' table";
+      throw StorageException(rc, sqlite3_errstr(rc));
+    }
   }
 
   std::unique_ptr<SqlQuery> Sql(std::string query) {
-    return std::make_unique<SqlQueryImpl>(db_,
-                                          std::forward<std::string>(query));
+    return std::make_unique<SqlQueryImpl>(db_, std::move(query));
+  }
+
+  void BeginTransaction() {
+    if (active_transaction_) {
+      LOG(kError) << "Attempted to begin transaction while another "
+                     "transaction is active. Nested transactions not supported";
+      throw std::runtime_error("Cannot nest transactions");
+    }
+    active_transaction_ = true;
+
+    int rc = sqlite3_exec(db_->Get(), "BEGIN TRANSACTION", nullptr, nullptr,
+                          nullptr);
+    if (rc != SQLITE_OK) {
+      LOG(kError) << "Failed to begin transaction";
+      throw StorageException(rc, sqlite3_errstr(rc));
+    }
+  }
+
+  void CommitTransaction() {
+    if (active_transaction_) {
+      active_transaction_ = false;
+      int rc = sqlite3_exec(db_->Get(), "COMMIT TRANSACTION", nullptr, nullptr,
+                            nullptr);
+      if (rc != SQLITE_OK) {
+        LOG(kError) << "Failed to commit transaction";
+        throw StorageException(rc, sqlite3_errstr(rc));
+      }
+    }
+  }
+
+  void RollbackTransaction() {
+    if (active_transaction_) {
+      active_transaction_ = false;
+      int rc = sqlite3_exec(db_->Get(), "ROLLBACK TRANSACTION", nullptr,
+                            nullptr, nullptr);
+      if (rc != SQLITE_OK) {
+        LOG(kError) << "Failed to rollback transaction";
+        throw StorageException(rc, sqlite3_errstr(rc));
+      }
+    }
   }
 
 private:
   std::shared_ptr<DbConn> db_;
+  bool active_transaction_;
 };
 
 StorageManager::StorageManager(fs::path db_path)
@@ -323,14 +403,21 @@ StorageManager::StorageManager(fs::path db_path)
 
 StorageManager::~StorageManager() = default;
 
-std::unique_ptr<SqlQuery> StorageManager::Sql(std::string query) {
+std::unique_ptr<SqlQuery> StorageManager::Sql(std::string &query) {
   return pimpl_->Sql(query);
 }
 
-void StorageManager::SqlExec(std::string query,
-                             SqlQuery::SqlCallback callback) {
-  auto q = pimpl_->Sql(query);
-  q->Run(callback);
+std::unique_ptr<SqlQuery> StorageManager::Sql(std::string &&query) {
+  return pimpl_->Sql(std::forward<std::string>(query));
 }
+
+SqlTransaction StorageManager::BeginTransaction() {
+  pimpl_->BeginTransaction();
+  return SqlTransaction(this);
+}
+
+void StorageManager::CommitTransaction() { pimpl_->CommitTransaction(); }
+
+void StorageManager::RollbackTransaction() { pimpl_->RollbackTransaction(); }
 
 } /* namespace cheri */
