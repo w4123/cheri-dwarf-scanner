@@ -79,6 +79,7 @@ std::ostream &operator<<(std::ostream &os, const StructMemberRow &row);
  * Helper to hold the data for a row in the member_bounds table.
  */
 struct MemberBoundsRow {
+  uint64_t id;
   uint64_t owner;
   uint64_t member;
   std::string name;
@@ -167,21 +168,22 @@ protected:
    */
   std::unordered_map<uint64_t, int64_t> struct_type_cache_;
 
-  /**
+  /*
    * Pre-compiled queries for InsertStructLayout.
    */
   std::unique_ptr<SqlQuery> insert_struct_query_;
   std::unique_ptr<SqlQuery> select_struct_query_;
 
-  /**
+  /*
    * Pre-compiled queries for InsertStructMember.
    */
   std::unique_ptr<SqlQuery> insert_member_query_;
 
-  /**
-   * Pre-compiled queries for InsertMemberBounds.
+  /*
+   * Pre-compiled queries for FindSubobjectCapabilities.
    */
   std::unique_ptr<SqlQuery> insert_member_bounds_query_;
+  std::unique_ptr<SqlQuery> find_imprecise_alias_query_;
 };
 
 } /* namespace cheri */

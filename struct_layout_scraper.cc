@@ -79,16 +79,16 @@ void StructLayoutScraper::InitSchema() {
   sm_.SqlExec("CREATE TABLE IF NOT EXISTS struct_type ("
               "id INTEGER NOT NULL PRIMARY KEY,"
               // File where the struct is defined
-              "file text NOT NULL,"
+              "file TEXT NOT NULL,"
               // Line where the struct is defined
-              "line int NOT NULL,"
+              "line INTEGER NOT NULL,"
               // Name of the type.
               // If this is anonymous, a synthetic name is created.
-              "name text,"
+              "name TEXT,"
               // Size of the strucutre including any padding
-              "size int NOT NULL,"
+              "size INTEGER NOT NULL,"
               // Flags that determine whether this is a struct/union/class
-              "flags int DEFAULT 0 NOT NULL,"
+              "flags INTEGER DEFAULT 0 NOT NULL,"
               "UNIQUE(name, file, line))");
 
   /*
@@ -116,27 +116,27 @@ void StructLayoutScraper::InitSchema() {
   sm_.SqlExec("CREATE TABLE IF NOT EXISTS struct_member ("
               "id INTEGER NOT NULL PRIMARY KEY,"
               // Index of the owning structure
-              "owner int NOT NULL,"
+              "owner INTEGER NOT NULL,"
               // Optional index of the nested structure
               "nested int,"
               // Member name, anonymous members have synthetic names
-              "name text NOT NULL,"
+              "name TEXT NOT NULL,"
               // Type name of the member, for nested structures, this is the
               // same as struct_type.name
-              "type_name text NOT NULL,"
+              "type_name TEXT NOT NULL,"
               // Line in the file where the member is defined
-              "line int NOT NULL,"
+              "line INTEGER NOT NULL,"
               // Size (bytes) of the member, this may or may not include internal
               // padding
-              "size int NOT NULL,"
+              "size INTEGER NOT NULL,"
               // Bit remainder of the size, only valid for bitfields
               "bit_size int,"
               // Offset (bytes) of the member with respect to the owner
-              "offset int NOT NULL,"
+              "offset INTEGER NOT NULL,"
               // Bit remainder of the offset, only valid for bitfields
               "bit_offset int,"
               // Type flags
-              "flags int DEFAULT 0 NOT NULL,"
+              "flags INTEGER DEFAULT 0 NOT NULL,"
               "array_items int,"
               "FOREIGN KEY (owner) REFERENCES struct_type (id),"
               "FOREIGN KEY (nested) REFERENCES struct_type (id),"
@@ -190,19 +190,20 @@ void StructLayoutScraper::InitSchema() {
    * of a structure.
    */
   sm_.SqlExec("CREATE TABLE IF NOT EXISTS member_bounds ("
+              // ID of the flattened layout entry
+              "id INTEGER NOT NULL PRIMARY KEY,"
               // ID of the struct_type containing this member
-              "owner int NOT NULL,"
+              "owner INTEGER NOT NULL,"
               // Flattened name for the layout entry
-              "name text NOT NULL,"
+              "name TEXT NOT NULL,"
               // ID of the corresponding member entry in struct_members
-              "member int NOT NULL,"
+              "member INTEGER NOT NULL,"
               // Cumulative offset of this member from the start of owner
-              "offset int NOT NULL,"
+              "offset INTEGER NOT NULL,"
               // Representable sub-object base
-              "representable_base int NOT NULL,"
+              "base INTEGER NOT NULL,"
               // Representable top of the sub-object
-              "representable_top int NOT NULL,"
-              "PRIMARY KEY (owner, name),"
+              "top INTEGER NOT NULL,"
               "FOREIGN KEY (owner) REFERENCES struct_type (id),"
               "FOREIGN KEY (member) REFERENCES struct_member (id))");
 
@@ -211,8 +212,61 @@ void StructLayoutScraper::InitSchema() {
    */
   insert_member_bounds_query_ = sm_.Sql(
       "INSERT INTO member_bounds ("
-      "  owner, member, offset, name, representable_base, representable_top) "
+      "  owner, member, offset, name, base, top) "
       "VALUES(@owner, @member, @offset, @name, @base, @top)");
+
+  /*
+   * Create table holding imprecise sub-objects for each structure
+   */
+  sm_.SqlExec("CREATE TABLE IF NOT EXISTS subobject_alias ("
+              // Member bounds for which the sub-object capability aliases
+              // a set of other members
+              "subobj INTEGER NOT NULL,"
+              // Member bounds entry that is accessible from the subobj
+              // capability
+              "alias INTEGER NOT NULL,"
+              "PRIMARY KEY (subobj, alias),"
+              "FOREIGN KEY (subobj) REFERENCES member_bounds (id),"
+              "FOREIGN KEY (alias) REFERENCES member_bounds (id))");
+
+  /*
+   * Create view to produce combinations of member_bounds to check for
+   * sub-object bounds aliasing.
+   */
+  sm_.SqlExec("CREATE VIEW IF NOT EXISTS alias_bounds AS "
+              "WITH impl ("
+              "  owner, id, alias_id, name, alias_name, base, check_base,"
+              "  top, check_top) "
+              "AS ("
+              "SELECT "
+              "  mb.owner,"
+              "  mb.id,"
+              "  alb.id AS alias_id,"
+              "  mb.name,"
+              "  alb.name AS alias_name,"
+              "  mb.base,"
+              "  alb.offset AS check_base,"
+              "  mb.top,"
+              "  (alb.offset + alm.size + IIF(alm.bit_size, 1, 0)) AS check_top "
+              "FROM member_bounds alb"
+              "  JOIN struct_member alm ON alb.member = alm.id"
+              "  JOIN member_bounds mb ON "
+              "    mb.owner = alb.owner AND mb.id != alb.id) "
+              "SELECT owner, id AS subobj_id, alias_id "
+              "FROM impl "
+              "WHERE "
+              "  MAX(check_base, base) < MIN(check_top, top) AND"
+              "  NOT (name LIKE alias_name || '%') AND"
+              "  NOT (alias_name LIKE name || '%')");
+
+  /*
+   * Pre-compiled queries for subobject alias discovery
+   */
+  find_imprecise_alias_query_ = sm_.Sql(
+      "INSERT INTO subobject_alias (subobj, alias)"
+      "  SELECT ab.subobj_id AS subobj, ab.alias_id AS alias"
+      "  FROM alias_bounds ab"
+      "  WHERE ab.owner = @owner");
   // clang-format on
 }
 
@@ -414,6 +468,7 @@ void StructLayoutScraper::FindSubobjectCapabilities(int64_t struct_type_id) {
   std::string q = std::format(
       "SELECT * FROM flattened_layout WHERE type_id = {}", struct_type_id);
 
+  auto timing = stats_.Timing("find_subobject");
   auto tx = sm_.BeginTransaction();
   sm_.SqlExec(q, [this, struct_type_id](SqlRowView result) {
     MemberBoundsRow mb_row;
@@ -429,9 +484,13 @@ void StructLayoutScraper::FindSubobjectCapabilities(int64_t struct_type_id) {
     InsertMemberBounds(mb_row);
     return false;
   });
+  // XXX can we do the alias groups in the same transaction?
   tx.Commit();
 
   // Determine the alias groups for the member capabilities
+  auto find_imprecise = find_imprecise_alias_query_->TakeCursor();
+  find_imprecise.Bind(struct_type_id);
+  find_imprecise.Run();
 }
 
 bool StructLayoutScraper::InsertStructLayout(const llvm::DWARFDie &die,

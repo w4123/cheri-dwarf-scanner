@@ -117,6 +117,16 @@ static cl::alias alias_verbose(
     cl::aliasopt(opt_verbose),
     cl::cat(cat_cheri_scraper));
 
+static cl::opt<bool> opt_clean(
+    "clean",
+    cl::desc("Wipe the database clean before running"),
+    cl::cat(cat_cheri_scraper));
+
+static cl::opt<std::string> opt_prefix(
+    "prefix",
+    cl::desc("Path prefix to strip from the source file paths"),
+    cl::cat(cat_cheri_scraper));
+
 static cl::opt<unsigned int> opt_workers(
     "threads",
     cl::desc("Use parallel threads for DWARF traversal, (defaults to #CPU)"),
@@ -175,7 +185,14 @@ int main(int argc, char **argv) {
 
   LOG(cheri::kDebug) << "Initialize thread pool with " << opt_workers
                      << " workers";
-  ScrapeContext ctx(opt_workers, fs::path(opt_database.c_str()));
+  if (opt_clean) {
+    LOG(cheri::kDebug) << "Wiping database at " << opt_database;
+    auto path = fs::path(opt_database.getValue());
+    if (fs::exists(path)) {
+      fs::remove(path);
+    }
+  }
+  ScrapeContext ctx(opt_workers, fs::path(opt_database.getValue()));
 
   if (!opt_stdin && opt_input.size() == 0) {
     LOG(cheri::kError)
