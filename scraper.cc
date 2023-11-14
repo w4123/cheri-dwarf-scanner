@@ -204,6 +204,27 @@ DwarfSource::FindRepresentableRange(uint64_t base, uint64_t length) const {
   throw std::runtime_error("Unsupported architecture");
 }
 
+short DwarfSource::FindRequiredPrecision(uint64_t base, uint64_t length) const {
+#if !__has_builtin(__builtin_clzll) || !__has_builtin(__builtin_ffsll)
+#error "__builtin_clzll and ffsll are required!"
+#endif
+  if (length == 0)
+    return 0;
+
+  uint64_t top = base + length;
+  LOG(kDebug) << "FindPrecision b=0x" << std::hex << base << " l=" << length
+              << " t=" << top << std::dec;
+  int len_msb = 64 - __builtin_clzll(length);
+  int exp = 0;
+  if (base == 0) {
+    exp = __builtin_ffsll(top);
+  } else {
+    exp = std::min(__builtin_ffsll(base), __builtin_ffsll(top));
+  }
+  LOG(kDebug) << "MSB=" << len_msb << " EXP=" << exp;
+  return len_msb - exp + 1;
+}
+
 DwarfScraper::DwarfScraper(StorageManager &sm,
                            std::shared_ptr<const DwarfSource> dwsrc)
     : sm_{sm}, dwsrc_{dwsrc} {}

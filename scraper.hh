@@ -85,6 +85,25 @@ public:
   int GetABICapabilitySize() const;
   std::pair<uint64_t, uint64_t> FindRepresentableRange(uint64_t base,
                                                        uint64_t length) const;
+  /**
+   * This should produce the mantissa size required to precisely
+   * represent a (base, length) pair in the Cheri compressed capability
+   * format.
+   * For example, a capability with base=0x0, top=0x100000 requires 1 bit
+   * of precision (considering the exponent as a separate field).
+   * A capability with base=0x04, top=0x1004 requires 11 bits of precision,
+   * with the exponent = 2, leaving a range of 11 bits between msb and lsb
+   * of the cursor range.
+   *
+   * Note that this says nothing about the number of bits in the mantissa or
+   * the encoding, it just estimates the number of bits of information that
+   * the capability format requires. In particular, the mantissa width will
+   * be larger because we require a non-dereferenceable representable region
+   * around the capability.
+   *
+   * Place it here because it may be arch-specific.
+   */
+  short FindRequiredPrecision(uint64_t base, uint64_t length) const;
 
 private:
   std::filesystem::path path_;

@@ -205,6 +205,9 @@ void StructLayoutScraper::InitSchema() {
               "base INTEGER NOT NULL,"
               // Representable top of the sub-object
               "top INTEGER NOT NULL,"
+              // Require number of precision bits required to exactly represent
+              // the capability
+              "precision INTEGER,"
               "FOREIGN KEY (owner) REFERENCES struct_type (id),"
               "FOREIGN KEY (member) REFERENCES struct_member (id))");
 
@@ -213,8 +216,8 @@ void StructLayoutScraper::InitSchema() {
    */
   insert_member_bounds_query_ = sm_.Sql(
       "INSERT INTO member_bounds ("
-      "  owner, member, offset, name, base, top) "
-      "VALUES(@owner, @member, @offset, @name, @base, @top)");
+      "  owner, member, offset, name, base, top, precision) "
+      "VALUES(@owner, @member, @offset, @name, @base, @top, @precision)");
 
   /*
    * Create table holding imprecise sub-objects for each structure
@@ -481,10 +484,13 @@ void StructLayoutScraper::FindSubobjectCapabilities(int64_t struct_type_id) {
     result.Fetch("flat_name", mb_row.name);
     result.Fetch("flat_offset", mb_row.offset);
     // XXX bit rounding
-    auto [base, length] = dwsrc_->FindRepresentableRange(
-        mb_row.offset, result.FetchAs<uint64_t>("size"));
+    uint64_t req_length = result.FetchAs<uint64_t>("size");
+    auto [base, length] =
+        dwsrc_->FindRepresentableRange(mb_row.offset, req_length);
     mb_row.base = base;
     mb_row.top = base + length;
+    mb_row.required_precision =
+        dwsrc_->FindRequiredPrecision(mb_row.offset, req_length);
     InsertMemberBounds(mb_row);
     return false;
   });
@@ -582,12 +588,13 @@ void StructLayoutScraper::InsertStructMembers(
 
 void StructLayoutScraper::InsertMemberBounds(const MemberBoundsRow &row) {
   auto cursor = insert_member_bounds_query_->TakeCursor();
-  cursor.Bind(row.owner, row.member, row.offset, row.name, row.base, row.top);
+  cursor.Bind(row.owner, row.member, row.offset, row.name, row.base, row.top,
+              row.required_precision);
   cursor.Run();
 
   LOG(kDebug) << "Record member bounds for " << row.name << std::hex
               << " base=0x" << row.base << " off=0x" << row.offset << " top=0x"
-              << row.top << std::dec;
+              << row.top << std::dec << " p=" << row.required_precision;
 }
 
 } /* namespace cheri */
