@@ -1,5 +1,6 @@
 #include <cassert>
 #include <iostream>
+#include <thread>
 
 #include "log.hh"
 
@@ -93,10 +94,12 @@ void ConsoleLogSink::Emit(LogMessage &msg) {
   switch (msg.level) {
   case kDebug:
   case kError:
-    std::cerr << msg.level << " " << msg.message << std::endl;
+    std::cerr << "[THR " << std::this_thread::get_id() << "]" << msg.level <<
+        " " << msg.message << std::endl;
     break;
   default:
-    std::cout << msg.level << " " << msg.message << std::endl;
+    std::cout << "[THR " << std::this_thread::get_id() << "]" << msg.level <<
+        " " << msg.message << std::endl;
   }
 }
 

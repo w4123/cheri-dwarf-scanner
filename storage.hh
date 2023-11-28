@@ -168,16 +168,6 @@ public:
   void BindAt(int pos, std::vector<std::byte> &&value);
   void BindAt(int pos, std::monostate _);
 
-  /**
-   * Begin a new SQL transaction for multiple queries
-   */
-  void BeginTransaction();
-
-  /**
-   * Commit an existing SQL transaction
-   */
-  void CommitTransaction();
-
 protected:
   template <typename T>
   void BindAt(int pos, T value)
@@ -251,13 +241,18 @@ class SqlTransaction;
  */
 class StorageManager {
 public:
+  using SqlTransactionFn = std::function<void(StorageManager*)>;
+
   StorageManager(std::filesystem::path db_path);
   StorageManager(StorageManager &other) = delete;
   ~StorageManager();
 
-  SqlTransaction BeginTransaction();
-  void CommitTransaction();
-  void RollbackTransaction();
+  /**
+   * Sql transaction interface.
+   * This begins a new transaction in deferred mode.
+   * By default, the conflicts are handled by retrying.
+   */
+  void Transaction(SqlTransactionFn fn);
 
   std::unique_ptr<SqlQuery> Sql(std::string &query);
   std::unique_ptr<SqlQuery> Sql(std::string &&query);
@@ -273,7 +268,7 @@ public:
 
   template <typename T>
   void SqlExec(T &&query)
-    requires std::constructible_from<std::string, T>
+      requires std::constructible_from<std::string, T>
   {
     SqlExec(std::forward<std::string>(query), nullptr);
   }
@@ -281,33 +276,6 @@ public:
 private:
   class StorageManagerImpl;
   std::unique_ptr<StorageManagerImpl> pimpl_;
-};
-
-/**
- * Helper RAII transaction object.
- * This rolls back the transaction when it goes out of scope.
- */
-class SqlTransaction {
-public:
-  SqlTransaction(StorageManager *sm) : sm_(sm) {}
-  ~SqlTransaction() { Rollback(); }
-
-  void Commit() {
-    if (sm_) {
-      sm_->CommitTransaction();
-      sm_ = nullptr;
-    }
-  }
-
-  void Rollback() {
-    if (sm_) {
-      sm_->RollbackTransaction();
-      sm_ = nullptr;
-    }
-  }
-
-private:
-  StorageManager *sm_;
 };
 
 } /* namespace cheri */

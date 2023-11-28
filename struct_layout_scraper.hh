@@ -86,6 +86,7 @@ struct MemberBoundsRow {
   uint64_t offset;
   uint64_t base;
   uint64_t top;
+  bool is_imprecise;
   short required_precision;
 };
 

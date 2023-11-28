@@ -212,8 +212,6 @@ short DwarfSource::FindRequiredPrecision(uint64_t base, uint64_t length) const {
     return 0;
 
   uint64_t top = base + length;
-  LOG(kDebug) << "FindPrecision b=0x" << std::hex << base << " l=" << length
-              << " t=" << top << std::dec;
   int len_msb = 64 - __builtin_clzll(length);
   int exp = 0;
   if (base == 0) {
@@ -221,13 +219,12 @@ short DwarfSource::FindRequiredPrecision(uint64_t base, uint64_t length) const {
   } else {
     exp = std::min(__builtin_ffsll(base), __builtin_ffsll(top));
   }
-  LOG(kDebug) << "MSB=" << len_msb << " EXP=" << exp;
   return len_msb - exp + 1;
 }
 
 DwarfScraper::DwarfScraper(StorageManager &sm,
                            std::shared_ptr<const DwarfSource> dwsrc)
-    : sm_{sm}, dwsrc_{dwsrc} {}
+    : sm_(sm), dwsrc_(dwsrc) {}
 
 void DwarfScraper::Extract(std::stop_token stop_tok) {
   auto &dictx = dwsrc_->GetContext();

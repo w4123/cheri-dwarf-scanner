@@ -42,16 +42,31 @@ struct ScrapeContext {
   using TaskFuture = std::shared_future<TaskResult>;
 
   ScrapeContext(unsigned long workers, fs::path db_file)
-      : pool(workers), storage(db_file) {}
+      : pool(workers), db_path(db_file) {}
 
   /* Thread pool where work is submitted */
   cheri::ThreadPool pool;
   /* Vector of future results */
   std::vector<TaskFuture> future_results;
-  /* Storage manager */
-  cheri::StorageManager storage;
+  /* Storage path */
+  fs::path db_path;
   /* File path prefix to strip */
   std::optional<std::string> strip_prefix;
+
+  std::unique_ptr<cheri::StorageManager> MakeStorage() const {
+    return std::make_unique<cheri::StorageManager>(db_path);
+  }
+
+  /**
+   * Retrieve or create a storage manager for the current worker thread.
+   */
+  cheri::StorageManager& GetWorkerStorageManager() {
+    static thread_local cheri::StorageManager sm(db_path);
+
+    LOG(cheri::kDebug) << "Worker " << std::this_thread::get_id() <<
+        " use storage manager " << &sm;
+    return sm;
+  }
 };
 
 std::unique_ptr<cheri::DwarfScraper>
@@ -61,7 +76,7 @@ MakeScraper(ScraperID id, ScrapeContext &ctx,
   switch (id) {
   case ScraperID::StructLayout:
     LOG(cheri::kDebug) << "Build StructLayout scraper for " << dwsrc->GetPath();
-    s = std::make_unique<cheri::StructLayoutScraper>(ctx.storage, dwsrc);
+    s = std::make_unique<cheri::StructLayoutScraper>(ctx.GetWorkerStorageManager(), dwsrc);
     break;
   default:
     throw std::runtime_error("Unexpected scraper ID");
@@ -217,6 +232,7 @@ int main(int argc, char **argv) {
     while (std::cin >> path) {
       TryScrape(ctx, path, &opt_scrapers);
     }
+    LOG(cheri::kDebug) << "End of inputs";
   } else {
     LOG(cheri::kDebug) << "Reading target files from --input args";
     for (auto path : opt_input) {

@@ -5,6 +5,7 @@
 #include <numeric>
 #include <optional>
 #include <span>
+#include <thread>
 
 #include <sqlite3.h>
 
@@ -17,13 +18,19 @@ namespace fs = std::filesystem;
 namespace {
 using namespace cheri;
 
+class StorageBusyException : public StorageException {
+ public:
+  StorageBusyException(int rc, std::string message)
+      : StorageException(rc, std::move(message)) {}
+};
+
 /**
  * RAII sqlite3 connection object.
  */
 class DbConn {
 public:
   DbConn(fs::path db_path) : db_path_{db_path} {
-    LOG(kDebug) << "Open database @ " << db_path;
+    LOG(kDebug) << "Open database conn @ " << db_path;
     constexpr int flags =
         SQLITE_OPEN_READWRITE | SQLITE_OPEN_NOMUTEX | SQLITE_OPEN_CREATE;
     int rc = sqlite3_open_v2(db_path.c_str(), &conn_, flags, nullptr);
@@ -33,7 +40,7 @@ public:
   }
 
   ~DbConn() {
-    LOG(kDebug) << "Close database @ " << db_path_;
+    LOG(kDebug) << "Close database conn @ " << db_path_;
     if (conn_ != nullptr)
       sqlite3_close_v2(conn_);
   }
@@ -64,6 +71,10 @@ struct QueryCursorState {
       LOG(kError) << "Attempt to advance detached cursor";
       throw std::runtime_error("Invalid cursor state");
     }
+    if (stmt == nullptr) {
+      LOG(kError) << "Cursor is active but has invalidated statement";
+      throw std::runtime_error("Invalid cursor state");
+    }
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
       index++;
@@ -71,6 +82,8 @@ struct QueryCursorState {
     } else if (rc == SQLITE_DONE) {
       index++;
       return false;
+    } else if (rc == SQLITE_BUSY) {
+      throw StorageBusyException(rc, sqlite3_errstr(rc));
     } else {
       throw StorageException(rc, sqlite3_errstr(rc));
     }
@@ -180,23 +193,18 @@ std::shared_ptr<QueryCursorState> SqlQueryCursor::LockState() {
 void SqlQueryCursor::Run(SqlQueryCursor::SqlCallback callback) {
   auto state = LockState();
 
-  try {
-    while (state->Next()) {
-      if (callback) {
-        try {
-          if (callback(SqlRowView(state, state->index)))
-            break;
-        } catch (const std::exception &ex) {
-          LOG(kError) << "Failed to execute query callback: " << ex.what();
-          throw;
-        }
-      }
+  LOG(kDebug) << "Exec query: " << sqlite3_sql(state->stmt);
+
+  while (state->Next()) {
+    try {
+      if (callback && callback(SqlRowView(state, state->index)))
+        break;
+    } catch (const std::exception &ex) {
+      LOG(kError) << "Failed to execute query callback: " << ex.what();
+      throw;
     }
-  } catch (const std::exception &ex) {
-    LOG(kError) << "Failed to execute sql query: " << sqlite3_sql(state->stmt)
-                << " reason: " << ex.what();
-    throw;
   }
+
   // Reset the cursor state on success
   Reset();
 }
@@ -337,63 +345,63 @@ public:
     db_ = std::make_shared<DbConn>(db_path);
     active_transaction_ = false;
 
-    /* Initialize the database if necessary */
-    int rc = sqlite3_exec(db_->Get(),
-                          "CREATE TABLE IF NOT EXISTS jobs ("
-                          "id int NOT NULL PRIMARY KEY,"
-                          "name varchar(255) NOT NULL)",
-                          nullptr, nullptr, nullptr);
+    int rc = 0;
+    /*
+     * Always use WAL journaling, this has better concurrency properties.
+     * Just spin here to avoid complicated locking across storage managers.
+     */
+    rc = sqlite3_exec(db_->Get(), "PRAGMA journal_mode=WAL;", nullptr,
+                            nullptr, nullptr);
     if (rc != SQLITE_OK) {
-      LOG(kError) << "Failed to create 'jobs' table";
+      LOG(kError) << "Failed to set WAL journal mode";
       throw StorageException(rc, sqlite3_errstr(rc));
     }
+
+    /* Initialize the database if necessary */
+    auto make_jobs = Sql("CREATE TABLE IF NOT EXISTS jobs ("
+                         "id int NOT NULL PRIMARY KEY,"
+                         "name varchar(255) NOT NULL)");
+    make_jobs->TakeCursor().Run();
   }
 
   std::unique_ptr<SqlQuery> Sql(std::string query) {
     return std::make_unique<SqlQueryImpl>(db_, std::move(query));
   }
 
-  void BeginTransaction() {
+  void Transaction(std::function<void()> fn) {
     if (active_transaction_) {
       LOG(kError) << "Attempted to begin transaction while another "
-                     "transaction is active. Nested transactions not supported";
+          "transaction is active. Nested transactions not supported";
       throw std::runtime_error("Cannot nest transactions");
     }
     active_transaction_ = true;
-
-    int rc = sqlite3_exec(db_->Get(), "BEGIN TRANSACTION", nullptr, nullptr,
-                          nullptr);
-    if (rc != SQLITE_OK) {
-      LOG(kError) << "Failed to begin transaction";
-      throw StorageException(rc, sqlite3_errstr(rc));
-    }
-  }
-
-  void CommitTransaction() {
-    if (active_transaction_) {
+    try {
+      SqlFastExec("BEGIN TRANSACTION");
+      fn();
+      SqlFastExec("COMMIT TRANSACTION");
       active_transaction_ = false;
-      int rc = sqlite3_exec(db_->Get(), "COMMIT TRANSACTION", nullptr, nullptr,
-                            nullptr);
-      if (rc != SQLITE_OK) {
-        LOG(kError) << "Failed to commit transaction";
-        throw StorageException(rc, sqlite3_errstr(rc));
-      }
-    }
-  }
-
-  void RollbackTransaction() {
-    if (active_transaction_) {
+    } catch (const std::exception &ex) {
+      SqlFastExec("ROLLBACK TRANSACTION");
       active_transaction_ = false;
-      int rc = sqlite3_exec(db_->Get(), "ROLLBACK TRANSACTION", nullptr,
-                            nullptr, nullptr);
-      if (rc != SQLITE_OK) {
-        LOG(kError) << "Failed to rollback transaction";
-        throw StorageException(rc, sqlite3_errstr(rc));
-      }
+      throw;
     }
   }
 
 private:
+  /**
+   * Internal helper to execute a query string.
+   * This may be used inside a transaction. If the database is busy, this
+   * raises a StorageBusyException, which must be handled.
+   */
+  void SqlFastExec(std::string query) {
+    int rc = sqlite3_exec(db_->Get(), query.c_str(), nullptr, nullptr, nullptr);
+    if (rc == SQLITE_BUSY) {
+      throw StorageBusyException(rc, sqlite3_errstr(rc));
+    } else if (rc != SQLITE_OK) {
+      throw StorageException(rc, sqlite3_errstr(rc));
+    }
+  }
+
   std::shared_ptr<DbConn> db_;
   bool active_transaction_;
 };
@@ -411,13 +419,8 @@ std::unique_ptr<SqlQuery> StorageManager::Sql(std::string &&query) {
   return pimpl_->Sql(std::forward<std::string>(query));
 }
 
-SqlTransaction StorageManager::BeginTransaction() {
-  pimpl_->BeginTransaction();
-  return SqlTransaction(this);
+void StorageManager::Transaction(SqlTransactionFn fn) {
+  pimpl_->Transaction(std::bind(fn, this));
 }
-
-void StorageManager::CommitTransaction() { pimpl_->CommitTransaction(); }
-
-void StorageManager::RollbackTransaction() { pimpl_->RollbackTransaction(); }
 
 } /* namespace cheri */
