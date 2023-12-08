@@ -113,14 +113,15 @@ llvm::DWARFDie FindFirstChild(const llvm::DWARFDie &die, dwarf::Tag tag) {
 }
 
 std::string AnonymousName(const llvm::DWARFDie &die,
-                          const std::optional<fs::path> &strip) {
+                          const std::optional<fs::path> &strip,
+                          const std::string prefix) {
   using FLIKind = llvm::DILineInfoSpecifier::FileLineInfoKind;
   std::string file = die.getDeclFile(FLIKind::AbsoluteFilePath);
   if (strip) {
     file = fs::relative(file, *strip);
   }
   unsigned long line = die.getDeclLine();
-  return std::format("<anon>@{}+{:d}", file, line);
+  return std::format("<anon@{}{}+{:d}>", prefix, file, line);
 }
 
 DwarfSource::DwarfSource(fs::path path) : path_{path} {
@@ -308,6 +309,9 @@ void DwarfScraper::GetTypeInfo(const llvm::DWARFDie &die, TypeInfo &info) {
     case dwarf::DW_TAG_union_type: {
       using FLIKind = llvm::DILineInfoSpecifier::FileLineInfoKind;
       info.decl_file = iter_die->getDeclFile(FLIKind::AbsoluteFilePath);
+      if (strip_prefix_) {
+        info.decl_file = fs::relative(*info.decl_file, *strip_prefix_);
+      }
       info.decl_line = iter_die->getDeclLine();
       info.decl_name = GetStrAttr(*iter_die, dwarf::DW_AT_name)
                            .value_or(AnonymousName(*iter_die, strip_prefix_));
@@ -355,7 +359,13 @@ void DwarfScraper::GetTypeInfo(const llvm::DWARFDie &die, TypeInfo &info) {
     }
     case dwarf::DW_TAG_const_type:
     case dwarf::DW_TAG_volatile_type:
+      break;
     case dwarf::DW_TAG_typedef:
+      info.alias_name = GetStrAttr(*iter_die, dwarf::DW_AT_name);
+      if (!info.alias_name) {
+        LOG(kError) << "Invalid typedef, missing type name";
+        throw std::runtime_error("Typedef without name");
+      }
       break;
     case dwarf::DW_TAG_reference_type:
     case dwarf::DW_TAG_rvalue_reference_type:
@@ -400,7 +410,7 @@ void DwarfScraper::GetTypeInfo(const llvm::DWARFDie &die, TypeInfo &info) {
     }
   }
 
-  if ((info.flags & TypeInfoFlags::kTypeIsAnon) != TypeInfoFlags::kTypeNone) {
+  if (!!(info.flags & TypeInfoFlags::kTypeIsAnon)) {
     // Anonymous types must render the name according to our pattern
     info.type_name = std::format("<anon>@{}+{:d}", info.decl_file.value(),
                                  info.decl_line.value());

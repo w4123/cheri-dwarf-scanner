@@ -137,9 +137,9 @@ static cl::alias alias_verbose(
     cl::desc("Alias for --verbose"),
     cl::aliasopt(opt_verbose),
     cl::cat(cat_cheri_scraper));
-static cl::opt<bool> opt_sql_debug(
-    "sql-debug",
-    cl::desc("Enable SQL query tracing output"),
+static cl::opt<bool> opt_debug(
+    "trace",
+    cl::desc("Enable extra debug output"),
     cl::cat(cat_cheri_scraper));
 
 static cl::opt<bool> opt_clean(
@@ -212,7 +212,7 @@ int main(int argc, char **argv) {
   if (opt_verbose) {
     logger.SetLevel(cheri::kDebug);
   }
-  if (opt_sql_debug) {
+  if (opt_debug) {
     logger.SetLevel(cheri::kTrace);
   }
 

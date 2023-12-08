@@ -40,11 +40,13 @@ struct StructTypeRow {
   static StructTypeRow FromSql(SqlRowView view);
 
   StructTypeRow()
-      : id(0), line(0), size(0), flags(StructTypeFlags::kTypeNone) {}
+      : id(0), line(0), size(0), flags(StructTypeFlags::kTypeNone),
+        has_imprecise(false) {}
   uint64_t id;
   std::string file;
   unsigned long line;
   std::string name;
+  std::optional<std::string> alias_name;
   uint64_t size;
   StructTypeFlags flags;
   bool has_imprecise;
@@ -62,6 +64,28 @@ struct StructMemberRow {
   StructMemberRow()
       : id(0), owner(0), line(0), byte_size(0), byte_offset(0),
         flags(TypeInfoFlags::kTypeNone) {}
+
+  /**
+   * Helper to check whether the member type is an anonymous
+   * struct, union or class.
+   */
+  bool HasAnonRecordType() const {
+    if (!(flags & TypeInfoFlags::kTypeIsAnon))
+      return false;
+    return HasRecordType();
+  }
+
+  /**
+   * Helper to check whether the member type is a record type.
+   */
+  bool HasRecordType() const {
+    if (!(flags & TypeInfoFlags::kTypeIsStruct) &&
+        !(flags & TypeInfoFlags::kTypeIsClass) &&
+        !(flags & TypeInfoFlags::kTypeIsUnion))
+      return false;
+    return true;
+  }
+
   uint64_t id;
   uint64_t owner;
   std::optional<uint64_t> nested;
@@ -93,12 +117,18 @@ struct MemberBoundsRow {
   short required_precision;
 };
 
+std::ostream &operator<<(std::ostream &os, const MemberBoundsRow &row);
+
 /**
  * Entry in the layout scraper temporary storage.
  */
 struct StructTypeEntry {
+  StructTypeEntry() : skip_postprocess(false), die_offset(-1) {}
+
   // Flag this entry as already exising in the DB
   bool skip_postprocess;
+  // Offset of the related type DIE
+  uint64_t die_offset;
   // Structure entry data
   StructTypeRow data;
   // Direct member information
@@ -106,15 +136,15 @@ struct StructTypeEntry {
   // Flattened layout entries
   std::vector<MemberBoundsRow> flattened_layout;
 };
-using StructTypeId = std::tuple<std::string, std::string, size_t>;
+using SourceLoc = std::tuple<std::string, size_t>;
+using SourceEntrySet = std::vector<std::shared_ptr<StructTypeEntry>>;
 
-struct StructTypeIdHash {
-  std::size_t operator()(const StructTypeId &k) const noexcept {
+struct SourceLocHash {
+  std::size_t operator()(const SourceLoc &k) const noexcept {
     std::size_t h0 = std::hash<std::string>{}(std::get<0>(k));
-    std::size_t h1 = std::hash<std::string>{}(std::get<1>(k));
-    std::size_t h2 = std::hash<std::size_t>{}(std::get<2>(k));
+    std::size_t h1 = std::hash<std::size_t>{}(std::get<1>(k));
 
-    return llvm::hash_combine(h0, h1, h2);
+    return llvm::hash_combine(h0, h1);
   }
 };
 
@@ -175,19 +205,11 @@ protected:
                               const StructTypeRow &row, int member_index);
 
   /**
-   * Visit the DIE chain for a structure member type.
-   */
-  std::optional<uint64_t> VisitMemberType(const llvm::DWARFDie &die,
-                                          StructMemberRow &member);
-
-  /**
    * Compute sub-object member capabilities for all nested members of
    * a given type. The type is assumed to have been fully evaluated
    * and we have DB entries for all nested members.
    */
-  void FindSubobjectCapabilities(
-      std::unordered_map<uint64_t, StructTypeEntry *> &struct_by_id,
-      StructTypeEntry &entry);
+  void FindSubobjectCapabilities(StructTypeEntry &entry);
 
   /**
    * Insert a new struct layout into the layouts table.
@@ -207,23 +229,36 @@ protected:
   void InsertMemberBounds(const MemberBoundsRow &row);
 
   /**
-   * Cache DIE offsets to struct_type indices.
+   * Compilation unit currently being scanned
    */
-  std::unordered_map<uint64_t, int64_t> struct_type_cache_;
+  std::string unit_name_;
 
   /**
-   * Record structure types discovered for a compilation unit.
-   * When the CU is scanned, the structure information is
-   * dumped to the database.
+   * Structure descriptor entries.
+   * Vector containing the StructTypeEntry descriptors for the current
+   * compilation unit.
    */
-  std::unordered_map<StructTypeId, StructTypeEntry, StructTypeIdHash>
-      struct_type_map_;
+  std::vector<std::shared_ptr<StructTypeEntry>> record_descriptors_;
+
+  /**
+   * Index for the structure descriptor entries.
+   * Associate a (file, line) tuple to a set of entries defined at
+   * that source location.
+   */
+  std::unordered_map<SourceLoc, SourceEntrySet, SourceLocHash> source_map_;
+
+  /**
+   * Index for the structure descriptor entries.
+   * Map local structure type IDs to StructTypeEntry objects.
+   */
+  std::unordered_map<uint64_t, std::shared_ptr<StructTypeEntry>> entry_by_id_;
 
   /*
    * Pre-compiled queries for InsertStructLayout.
    */
   std::unique_ptr<SqlQuery> insert_struct_query_;
   std::unique_ptr<SqlQuery> select_struct_query_;
+  std::unique_ptr<SqlQuery> set_has_imprecise_query_;
 
   /*
    * Pre-compiled queries for InsertStructMember.

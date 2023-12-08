@@ -68,7 +68,8 @@ llvm::DWARFDie FindFirstChild(const llvm::DWARFDie &die, llvm::dwarf::Tag tag);
  * This is used to construct anonymous names of record types.
  */
 std::string AnonymousName(const llvm::DWARFDie &die,
-                          const std::optional<std::filesystem::path> &strip);
+                          const std::optional<std::filesystem::path> &strip,
+                          std::string prefix = "");
 
 /**/
 
@@ -188,11 +189,11 @@ struct TypeInfo {
   TypeInfo() : byte_size(0), flags(TypeInfoFlags::kTypeNone) {}
 
   std::string type_name;
+  std::optional<std::string> alias_name;
   unsigned long byte_size;
   TypeInfoFlags flags;
   std::optional<unsigned long> array_items;
   llvm::DWARFDie type_die;
-  // Drop these
   std::optional<std::string> decl_name;
   std::optional<std::string> decl_file;
   std::optional<unsigned long> decl_line;

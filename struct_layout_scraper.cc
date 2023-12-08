@@ -63,6 +63,18 @@ std::ostream &operator<<(std::ostream &os, const StructMemberRow &row) {
   return os;
 }
 
+std::ostream &operator<<(std::ostream &os, const MemberBoundsRow &row) {
+  os << "MemberBounds{"
+     << "id=" << row.id << ", "
+     << "owner=" << row.owner << ", "
+     << "member=" << row.member << ", " << row.name << " "
+     << "@" << row.offset << " "
+     << "[" << row.base << ", " << row.top << "] "
+     << "imprecise=" << row.is_imprecise;
+
+  return os;
+}
+
 /**
  * Initialize the storage schema.
  */
@@ -107,6 +119,9 @@ void StructLayoutScraper::InitSchema() {
   select_struct_query_ = sm_.Sql(
       "SELECT * FROM struct_type WHERE file = @file AND line = @line "
       "AND name = @name");
+
+  set_has_imprecise_query_ = sm_.Sql(
+      "UPDATE struct_type SET has_imprecise = 1 WHERE id = @id");
 
   /*
    * Expresses the composition between struct types and
@@ -271,11 +286,10 @@ bool StructLayoutScraper::visit_typedef(llvm::DWARFDie &die) { return false; }
 
 void StructLayoutScraper::BeginUnit(llvm::DWARFDie &unit_die) {
   auto at_name = unit_die.find(dwarf::DW_AT_name);
-  std::string unit_name;
   if (at_name) {
     llvm::Expected name_or_err = at_name->getAsCString();
     if (name_or_err) {
-      unit_name = *name_or_err;
+      unit_name_ = *name_or_err;
     } else {
       LOG(kError) << "Invalid compilation unit, can't extract AT_name";
       throw std::runtime_error("Invalid compliation unit");
@@ -284,46 +298,41 @@ void StructLayoutScraper::BeginUnit(llvm::DWARFDie &unit_die) {
     LOG(kError) << "Invalid compliation unit, missing AT_name";
     throw std::runtime_error("Invalid compliation unit");
   }
-  LOG(kDebug) << "Enter compilation unit " << unit_name;
+  LOG(kDebug) << "Enter compilation unit " << unit_name_;
 }
 
 void StructLayoutScraper::EndUnit(llvm::DWARFDie &unit_die) {
-  // Drain the struct_type_map_ and push the data to the database
+  // Process the descriptors for this compilation unit
 
-  // Temporary mapping between struct_type IDs and entries
-  std::unordered_map<uint64_t, StructTypeEntry *> entry_by_id;
-
-  sm_.Transaction([this, &entry_by_id](StorageManager *_) {
-    entry_by_id.clear();
-
+  sm_.Transaction([this](StorageManager *_) {
     // Insert structure layouts first, this allows us to fixup
     // the row ID with the real database ID.
     // The remap_id is used to fixup structure type IDs for duplicate
     // structures that already exist in the database.
     std::unordered_map<uint64_t, uint64_t> remap_id;
 
-    for (auto &[_, entry] : struct_type_map_) {
-      LOG(kDebug) << "Try insert struct " << entry.data.name;
-      uint64_t local_id = entry.data.id;
+    for (auto &entry : record_descriptors_) {
+      uint64_t local_id = entry->data.id;
       assert(local_id != 0 && "Unassigned local ID");
-      bool new_entry = InsertStructLayout(entry.data);
-      assert(entry.data.id != 0 && "Unassigned global ID");
+      bool new_entry = InsertStructLayout(entry->data);
+      assert(entry->data.id != 0 && "Unassigned global ID");
       if (!new_entry) {
         // Need to remap this ID
-        remap_id.insert({local_id, entry.data.id});
-        entry.skip_postprocess = true;
+        remap_id.insert({local_id, entry->data.id});
+        entry->skip_postprocess = true;
+        // Because IDs are globally unique, we can add the alias mapping
+        // directly to the entry_by_id_ map.
+        entry_by_id_.insert({entry->data.id, entry});
       }
-      entry_by_id.insert({entry.data.id, &entry});
     }
 
     // Now that we have stable struct IDs, deal with the members
     // Note that we have filtered out duplicate structs
-    for (auto &[_, entry] : struct_type_map_) {
+    for (auto &entry : record_descriptors_) {
       // New entry, need to add members as well
-      uint64_t owner = entry.data.id;
+      uint64_t owner = entry->data.id;
       assert(owner != 0 && "Unassigned owner global ID");
-      for (auto &m : entry.members) {
-        LOG(kDebug) << "Try insert member" << m.name;
+      for (auto &m : entry->members) {
         assert(m.id != 0 && "Unassigned member local ID");
         m.owner = owner;
         if (m.nested) {
@@ -332,6 +341,9 @@ void StructLayoutScraper::EndUnit(llvm::DWARFDie &unit_die) {
             assert(m.owner != mapped->second && "Recursive member!");
             m.nested = mapped->second;
           }
+          // Ensure nested is valid
+          auto tmp = entry_by_id_.find(*m.nested);
+          assert(tmp != entry_by_id_.end() && "Invalid nested ID");
         }
         // XXX sync
         InsertStructMember(m);
@@ -343,27 +355,32 @@ void StructLayoutScraper::EndUnit(llvm::DWARFDie &unit_die) {
   // Now that we are done and we know exactly which structures we are
   // responsible for, generate the flattened layout
   // Compute the flattened layout data for the structures in this CU.
-  for (auto p : struct_type_map_) {
-    if (p.second.skip_postprocess)
+  for (auto &entry : record_descriptors_) {
+    if (entry->skip_postprocess)
       continue;
-    FindSubobjectCapabilities(entry_by_id, p.second);
+    FindSubobjectCapabilities(*entry);
+    LOG(kDebug) << "Flattened layout for " << entry->data.name << ": "
+                << entry->flattened_layout.size() << " entries";
   }
 
   sm_.Transaction([this](StorageManager *_) {
-    for (auto &[_, entry] : struct_type_map_) {
-      if (entry.skip_postprocess)
+    for (auto &entry : record_descriptors_) {
+      if (entry->skip_postprocess)
         continue;
-      for (auto mb_row : entry.flattened_layout) {
+      for (auto mb_row : entry->flattened_layout) {
         InsertMemberBounds(mb_row);
       }
       // Determine the alias groups for the member capabilities
       auto find_imprecise = find_imprecise_alias_query_->TakeCursor();
-      find_imprecise.Bind(entry.data.id);
+      find_imprecise.Bind(entry->data.id);
       find_imprecise.Run();
     }
   });
 
-  struct_type_map_.clear();
+  record_descriptors_.clear();
+  entry_by_id_.clear();
+  source_map_.clear();
+  LOG(kDebug) << "Done compilation unit " << unit_name_;
 }
 
 uint64_t StructLayoutScraper::GetStructTypeId() {
@@ -392,56 +409,60 @@ StructLayoutScraper::VisitCommon(const llvm::DWARFDie &die,
     throw std::runtime_error("Unsupported");
   }
 
-  StructTypeRow row;
+  TypeInfo record_type = GetTypeInfo(die);
 
+  auto new_entry = std::make_shared<StructTypeEntry>();
+  new_entry->die_offset = die.getOffset();
+
+  StructTypeRow &row = new_entry->data;
   row.flags |= kind;
-
-  /*
-   * Need to extract the following in order to determine whether this is a
-   * duplicate: (Name, File, Line, Size)
-   */
-  auto opt_size = GetULongAttr(die, dwarf::DW_AT_byte_size);
-  if (!opt_size) {
-    LOG(kWarn) << "Missing struct size for DIE @ 0x" << std::hex
-               << die.getOffset();
-    return std::nullopt;
-  }
-
-  row.size = *opt_size;
-  row.file = die.getDeclFile(FileLineInfoKind::AbsoluteFilePath);
-  row.line = die.getDeclLine();
-  if (strip_prefix_) {
-    row.file = fs::relative(row.file, *strip_prefix_);
-  }
-
-  auto name = GetStrAttr(die, dwarf::DW_AT_name);
-  if (name) {
-    row.name = *name;
-  } else {
-    row.name = AnonymousName(die, strip_prefix_);
+  if (!!(record_type.flags & TypeInfoFlags::kTypeIsAnon)) {
     row.flags |= StructTypeFlags::kTypeIsAnonymous;
   }
+  row.file = *record_type.decl_file;
+  row.line = *record_type.decl_line;
+  row.size = record_type.byte_size;
+  row.name = record_type.type_name;
 
-  auto key = std::make_tuple(row.name, row.file, row.line);
-  auto entry = struct_type_map_.find(key);
-  if (entry == struct_type_map_.end()) {
-    // Assign the global ID to the row, this is needed in VisitMember().
-    row.id = GetStructTypeId();
-    // Not a duplicate, we must collect the members
-    int member_index = 0;
-    StructTypeEntry e;
-    e.data = row;
-    for (auto &child : die.children()) {
-      if (child.getTag() == dwarf::DW_TAG_member) {
-        e.members.emplace_back(VisitMember(child, row, member_index++));
+  // Check whether the entry already exists
+  SourceEntrySet *entry_set = nullptr;
+  auto key = std::make_tuple(row.file, row.line);
+  auto it = source_map_.find(key);
+  if (it != source_map_.end()) {
+    // Check whether the record type has already been seen.
+    // Note that we use the offset as a unique discriminator
+    // within the compilation unit.
+    for (auto entry : it->second) {
+      if (entry->die_offset == die.getOffset()) {
+        assert(entry->data.name == row.name && "StructTypeRow mismatch");
+        assert(entry->data.file == row.file && "StructTypeRow mismatch");
+        assert(entry->data.line == row.line && "StructTypeRow mismatch");
+        // Found a match, do not need to add the entry.
+        return entry->data.id;
       }
     }
-
-    struct_type_map_.insert({key, e});
+    entry_set = &it->second;
   } else {
-    return entry->second.data.id;
+    // Nothing defined at this location yet, the structure is definitely new
+    // and we need to create the source_map vector.
+    auto [new_it, _] =
+        source_map_.emplace(std::piecewise_construct,
+                            std::forward_as_tuple(key), std::make_tuple());
+    entry_set = &new_it->second;
   }
+  // Finalize the new entry and insert
+  row.id = GetStructTypeId();
+  record_descriptors_.push_back(new_entry);
+  entry_set->push_back(new_entry);
+  entry_by_id_.insert({row.id, new_entry});
 
+  // Collect nested members
+  int member_index = 0;
+  for (auto &child : die.children()) {
+    if (child.getTag() == dwarf::DW_TAG_member) {
+      new_entry->members.emplace_back(VisitMember(child, row, member_index++));
+    }
+  }
   return row.id;
 }
 
@@ -460,16 +481,16 @@ StructMemberRow StructLayoutScraper::VisitMember(const llvm::DWARFDie &die,
 
   auto member_type_die = die.getAttributeValueAsReferencedDie(dwarf::DW_AT_type)
                              .resolveTypeUnitReference();
-  /*
-   * This is expected to set the following fields:
-   * - type_name
-   * - array_items
-   * - flags
-   * - byte_size
-   * It will return the ID of the nested structure type, if this is
-   * a nested union/struct/class.
-   */
-  VisitMemberType(member_type_die, member);
+  TypeInfo member_type = GetTypeInfo(member_type_die);
+  // Use the typedef name if possible
+  if (member_type.alias_name) {
+    member.type_name = *member_type.alias_name;
+  } else {
+    member.type_name = member_type.type_name;
+  }
+  member.byte_size = member_type.byte_size;
+  member.flags = member_type.flags;
+  member.array_items = member_type.array_items;
 
   /* Extract offsets, taking into account bitfields */
   member.byte_size =
@@ -498,37 +519,27 @@ StructMemberRow StructLayoutScraper::VisitMember(const llvm::DWARFDie &die,
 
   std::string name;
   if (!!(row.flags & StructTypeFlags::kTypeIsUnion)) {
-    name = std::format("<anon>@{:d}", member_index);
+    name = std::format("<union@{:d}>", member_index);
   } else {
-    name = std::format("<anon>@{:d}", member.byte_offset);
+    std::string bit_index;
     if (member.bit_offset) {
       name += std::format(":{:d}", *member.bit_offset);
     }
+    name = std::format("<record@{:d}{}>", member.byte_offset, bit_index);
   }
   member.name = GetStrAttr(die, dwarf::DW_AT_name).value_or(name);
 
-  return member;
-}
-
-std::optional<uint64_t>
-StructLayoutScraper::VisitMemberType(const llvm::DWARFDie &die,
-                                     StructMemberRow &member) {
-  /* Returned ID for the nested type, if any */
-  std::optional<uint64_t> nested_type_id = std::nullopt;
-
-  TypeInfo member_type = GetTypeInfo(die);
-
-  member.type_name = member_type.type_name;
-  member.byte_size = member_type.byte_size;
-  member.flags = member_type.flags;
-  member.array_items = member_type.array_items;
-
   /*
-   * In this case, we want to reference the nested aggregate type,
-   * if this does not exist yet, we must visit it to create an entry
-   * in the database.
+   * Now we have all the information to recursively visit nested type.
+   * Note that the type name requires disambiguation if the type is
+   * anonymous.
+   * It is not possible otherwise to distinguish between two anonymous
+   * structures with the same file/line combination. This happens with
+   * structures defined as part of macros.
+   * If the type is anonymous, we create a synthetic typedef if there isn't
+   * already a type alias.
    */
-  if (!!(member.flags & record_type_mask)) {
+  if (member.HasRecordType()) {
     StructTypeFlags flags = StructTypeFlags::kTypeNone;
     if (!!(member.flags & TypeInfoFlags::kTypeIsStruct))
       flags |= StructTypeFlags::kTypeIsStruct;
@@ -540,9 +551,16 @@ StructLayoutScraper::VisitMemberType(const llvm::DWARFDie &die,
     member.nested = VisitCommon(member_type.type_die, flags);
     assert(member.nested && *member.nested != 0 &&
            "Structure type ID must be set");
-    nested_type_id = member.nested;
+    auto nested_entry = entry_by_id_[*member.nested];
+
+    if (!!(member.flags & TypeInfoFlags::kTypeIsAnon) &&
+        !nested_entry->data.alias_name) {
+      nested_entry->data.alias_name =
+          AnonymousName(member_type.type_die, strip_prefix_, member.name + ":");
+    }
   }
-  return nested_type_id;
+
+  return member;
 }
 
 void StructLayoutScraper::InsertMemberBounds(const MemberBoundsRow &row) {
@@ -603,6 +621,10 @@ void StructLayoutScraper::InsertStructMember(StructMemberRow &row) {
   cursor.Run([&new_entry, &row](SqlRowView result) {
     new_entry = true;
     result.Fetch("id", row.id);
+    LOG(kDebug) << "Insert record member for " << row.name << " at "
+                << row.byte_offset << ":"
+                << ((row.bit_offset) ? *row.bit_offset : 0)
+                << " with ID=" << row.id;
     return true;
   });
 
@@ -618,9 +640,7 @@ void StructLayoutScraper::InsertStructMember(StructMemberRow &row) {
   }
 }
 
-void StructLayoutScraper::FindSubobjectCapabilities(
-    std::unordered_map<uint64_t, StructTypeEntry *> &entry_by_id,
-    StructTypeEntry &entry) {
+void StructLayoutScraper::FindSubobjectCapabilities(StructTypeEntry &entry) {
   if (!entry.flattened_layout.empty()) {
     // Already scanned, skip
     return;
@@ -628,8 +648,9 @@ void StructLayoutScraper::FindSubobjectCapabilities(
 
   std::function<void(StructTypeEntry &, uint64_t, std::string)> FlattenedLayout;
 
-  FlattenedLayout = [&, this](StructTypeEntry &curr, uint64_t offset,
-                              std::string prefix) {
+  FlattenedLayout = [this, &entry, &FlattenedLayout](StructTypeEntry &curr,
+                                                     uint64_t offset,
+                                                     std::string prefix) {
     for (auto m : curr.members) {
       MemberBoundsRow mb_row;
       mb_row.owner = entry.data.id;
@@ -649,26 +670,27 @@ void StructLayoutScraper::FindSubobjectCapabilities(
       }
       if (m.nested) {
         assert(*m.nested != 0 && "Missing member nested ID");
-        auto it = entry_by_id.find(m.nested.value());
-        assert(it != entry_by_id.end() &&
+        auto it = entry_by_id_.find(m.nested.value());
+        if (it == entry_by_id_.end()) {
+          LOG(kDebug) << "Invalid nested ID " << *m.nested;
+          for (auto tmp : entry_by_id_) {
+            LOG(kDebug) << "[" << tmp.first << "] " << tmp.second->data.name;
+          }
+        }
+        assert(it != entry_by_id_.end() &&
                "Entry is not in the compilation unit?");
         StructTypeEntry &nested = *it->second;
-        if (nested.flattened_layout.empty()) {
-          FlattenedLayout(nested, 0, nested.data.name);
-        }
-        // Merge the nested flat layout back here
-        for (auto flat_nested : nested.flattened_layout) {
-          entry.flattened_layout.push_back(flat_nested);
-          auto flat_curr = entry.flattened_layout.back();
-          flat_curr.offset += offset;
-          flat_curr.name =
-              prefix + flat_curr.name.substr(nested.data.name.length());
-        }
+        FlattenedLayout(*it->second, mb_row.offset, mb_row.name);
       }
       entry.flattened_layout.emplace_back(std::move(mb_row));
     }
   };
   FlattenedLayout(entry, 0, entry.data.name);
+
+  // If we found imprecise members, record it
+  auto cursor = set_has_imprecise_query_->TakeCursor();
+  cursor.BindAt("@id", entry.data.id);
+  cursor.Run();
 }
 
 } /* namespace cheri */
