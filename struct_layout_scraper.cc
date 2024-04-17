@@ -553,7 +553,7 @@ StructMemberRow StructLayoutScraper::VisitMember(const llvm::DWARFDie &die,
   auto bit_data_offset = GetULongAttr(die, dwarf::DW_AT_data_bit_offset);
   std::optional<unsigned long> bit_offset =
       (bit_data_offset) ? std::make_optional(data_offset * 8 + *bit_data_offset)
-                        : std::nullopt;
+                        : std::make_optional(data_offset * 8);
 
   auto old_style_bit_offset = GetULongAttr(die, dwarf::DW_AT_bit_offset);
   if (old_style_bit_offset) {
