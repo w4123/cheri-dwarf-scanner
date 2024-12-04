@@ -10,9 +10,11 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
 
+#include <QDebug>
+#include <QtLogging>
+
 #include "cheri_compressed_cap.h"
 
-#include "log.hh"
 #include "scraper.hh"
 
 namespace fs = std::filesystem;
@@ -51,7 +53,7 @@ template <> struct CapTraits<CompressedCap64> {
 };
 
 template <typename CC>
-std::pair<uint64_t, uint64_t> FindRepresentableRangeImpl(uint64_t base,
+std::pair<uint64_t, uint64_t> findRepresentableRangeImpl(uint64_t base,
                                                          uint64_t length) {
   using AddrT = typename CC::addr_t;
   using CheriCap = typename CC::cap_t;
@@ -71,24 +73,44 @@ std::pair<uint64_t, uint64_t> FindRepresentableRangeImpl(uint64_t base,
 
 namespace cheri {
 
-TimingScope ScrapeResult::Timing(std::string_view name) {
-  auto [entry, _] = profile.emplace(name, TimingInfo());
-  return TimingScope(entry->second);
+QDebug operator<<(QDebug debug, const std::filesystem::path &p) {
+  QDebugStateSaver saver(debug);
+  debug.nospace() << p.string();
+  return debug;
 }
 
-std::ostream &operator<<(std::ostream &os, const ScrapeResult &sr) {
-  os << "Result for " << sr.source << ":";
-  for (auto &prof : sr.profile) {
-    os << " |" << prof.first << "> #" << prof.second.events
-       << " avg:" << prof.second.avg;
-  }
+QDebug operator<<(QDebug debug, const ScraperResult &sr) {
+  QDebugStateSaver saver(debug);
+  QDebug stream = debug.nospace();
+  stream << "Result for " << sr.source << ":";
+  // for (auto &prof : sr.profile) {
+  //   stream << " |" << prof.first << "> #" << prof.second.events
+  //          << " avg:" << prof.second.avg;
+  // }
   if (sr.errors.size()) {
-    os << " (WITH ERRORS)";
+    stream << " (WITH ERRORS)";
   }
-  return os;
+  return debug;
 }
 
-std::optional<unsigned long> GetULongAttr(const llvm::DWARFDie &die,
+// TimingScope ScraperResult::Timing(std::string_view name) {
+//   auto [entry, _] = profile.emplace(name, TimingInfo());
+//   return TimingScope(entry->second);
+// }
+
+// std::ostream &operator<<(std::ostream &os, const ScraperResult &sr) {
+//   os << "Result for " << sr.source << ":";
+//   for (auto &prof : sr.profile) {
+//     os << " |" << prof.first << "> #" << prof.second.events
+//        << " avg:" << prof.second.avg;
+//   }
+//   if (sr.errors.size()) {
+//     os << " (WITH ERRORS)";
+//   }
+//   return os;
+// }
+
+std::optional<unsigned long> getULongAttr(const llvm::DWARFDie &die,
                                           dwarf::Attribute attr) {
   if (auto opt = dwarf::toUnsigned(die.find(attr))) {
     return *opt;
@@ -96,7 +118,7 @@ std::optional<unsigned long> GetULongAttr(const llvm::DWARFDie &die,
   return std::nullopt;
 }
 
-std::optional<std::string> GetStrAttr(const llvm::DWARFDie &die,
+std::optional<std::string> getStrAttr(const llvm::DWARFDie &die,
                                       dwarf::Attribute attr) {
   if (auto opt = dwarf::toString(die.find(attr))) {
     return *opt;
@@ -104,25 +126,17 @@ std::optional<std::string> GetStrAttr(const llvm::DWARFDie &die,
   return std::nullopt;
 }
 
-llvm::DWARFDie FindFirstChild(const llvm::DWARFDie &die, dwarf::Tag tag) {
-  for (auto &child : die) {
-    if (child.getTag() == tag)
-      return child;
-  }
-  return llvm::DWARFDie();
-}
-
-std::string AnonymousName(const llvm::DWARFDie &die,
-                          const std::optional<fs::path> &strip,
-                          const std::string prefix) {
-  using FLIKind = llvm::DILineInfoSpecifier::FileLineInfoKind;
-  std::string file = die.getDeclFile(FLIKind::AbsoluteFilePath);
-  if (strip) {
-    file = fs::relative(file, *strip);
-  }
-  unsigned long line = die.getDeclLine();
-  return std::format("<anon@{}{}+{:d}>", prefix, file, line);
-}
+// std::string getAnonymousName(const llvm::DWARFDie &die,
+//                              const std::optional<fs::path> &strip,
+//                              const std::string prefix) {
+//   using FLIKind = llvm::DILineInfoSpecifier::FileLineInfoKind;
+//   std::string file = die.getDeclFile(FLIKind::AbsoluteFilePath);
+//   if (strip) {
+//     file = fs::relative(file, *strip);
+//   }
+//   unsigned long line = die.getDeclLine();
+//   return std::format("<anon@{}{}+{:d}>", prefix, file, line);
+// }
 
 DwarfSource::DwarfSource(fs::path path) : path_{path} {
   static std::once_flag llvm_init_flag;
@@ -155,17 +169,17 @@ DwarfSource::DwarfSource(fs::path path) : path_{path} {
   }
 }
 
-fs::path DwarfSource::GetPath() const { return path_; }
+fs::path DwarfSource::getPath() const { return path_; }
 
-llvm::DWARFContext &DwarfSource::GetContext() const { return *dictx_; }
+llvm::DWARFContext &DwarfSource::getContext() const { return *dictx_; }
 
-int DwarfSource::GetABIPointerSize() const {
+int DwarfSource::getABIPointerSize() const {
   auto *obj = dictx_->getDWARFObj().getFile();
   assert(obj != nullptr && "Invalid DWARF source");
   auto triple = obj->makeTriple();
 
   if (triple.getEnvironment() == llvm::Triple::CheriPurecap) {
-    return GetABICapabilitySize();
+    return getABICapabilitySize();
   } else {
     if (triple.getArch() == llvm::Triple::aarch64 ||
         triple.getArch() == llvm::Triple::riscv64) {
@@ -177,7 +191,7 @@ int DwarfSource::GetABIPointerSize() const {
   throw std::runtime_error("Unsupported architecture");
 }
 
-int DwarfSource::GetABICapabilitySize() const {
+int DwarfSource::getABICapabilitySize() const {
   auto *obj = dictx_->getDWARFObj().getFile();
   assert(obj != nullptr && "Invalid DWARF source");
   auto triple = obj->makeTriple();
@@ -192,23 +206,23 @@ int DwarfSource::GetABICapabilitySize() const {
 }
 
 std::pair<uint64_t, uint64_t>
-DwarfSource::FindRepresentableRange(uint64_t base, uint64_t length) const {
+DwarfSource::findRepresentableRange(uint64_t base, uint64_t length) const {
   auto *obj = dictx_->getDWARFObj().getFile();
   assert(obj != nullptr && "Invalid DWARF source");
   auto triple = obj->makeTriple();
 
   if (triple.getArch() == llvm::Triple::aarch64) {
-    return FindRepresentableRangeImpl<CompressedCap128m>(base, length);
+    return findRepresentableRangeImpl<CompressedCap128m>(base, length);
   } else if (triple.getArch() == llvm::Triple::riscv64) {
-    return FindRepresentableRangeImpl<CompressedCap128>(base, length);
+    return findRepresentableRangeImpl<CompressedCap128>(base, length);
   } else if (triple.getArch() == llvm::Triple::riscv32) {
-    return FindRepresentableRangeImpl<CompressedCap64>(base, length);
+    return findRepresentableRangeImpl<CompressedCap64>(base, length);
   }
 
   throw std::runtime_error("Unsupported architecture");
 }
 
-short DwarfSource::FindRequiredPrecision(uint64_t base, uint64_t length) const {
+short DwarfSource::findRequiredPrecision(uint64_t base, uint64_t length) const {
 #if !__has_builtin(__builtin_clzll) || !__has_builtin(__builtin_ffsll)
 #error "__builtin_clzll and ffsll are required!"
 #endif
@@ -227,13 +241,13 @@ short DwarfSource::FindRequiredPrecision(uint64_t base, uint64_t length) const {
 }
 
 DwarfScraper::DwarfScraper(StorageManager &sm,
-                           std::shared_ptr<const DwarfSource> dwsrc)
-    : sm_(sm), dwsrc_(dwsrc) {}
+                           std::unique_ptr<const DwarfSource> dwsrc)
+    : sm_(sm), dwsrc_(std::move(dwsrc)) {}
 
-void DwarfScraper::Extract(std::stop_token stop_tok) {
-  auto &dictx = dwsrc_->GetContext();
+void DwarfScraper::run(std::stop_token stop_tok) {
+  auto &dictx = dwsrc_->getContext();
 
-  auto timing = stats_.Timing("elapsed_time");
+  // auto timing = stats_.Timing("elapsed_time");
   for (auto &unit : dictx.info_section_units()) {
     if (stop_tok.stop_requested()) {
       break;
@@ -246,177 +260,180 @@ void DwarfScraper::Extract(std::stop_token stop_tok) {
     }
 
     llvm::DWARFDie unit_die = unit->getUnitDIE(false);
-    BeginUnit(unit_die);
+    beginUnit(unit_die);
     try {
       /* Iterate over DIEs in the unit */
       llvm::DWARFDie child_die = unit_die.getFirstChild();
       bool stop = false;
       while (child_die && !stop && !stop_tok.stop_requested()) {
         // stop = impl::VisitDispatch(*this, child_die);
-        stop = this->DoVisit(child_die);
+        stop = this->doVisit(child_die);
         child_die = child_die.getSibling();
       }
     } catch (std::exception &ex) {
-      LOG(kError) << "Failed to scan compilation unit "
+      qCritical() << "Failed to scan compilation unit "
                   << unit_die.getName(llvm::DINameKind::LinkageName)
                   << " reason: " << ex.what();
       stats_.errors.push_back(ex.what());
     }
-    EndUnit(unit_die);
+    endUnit(unit_die);
   }
 }
 
-ScrapeResult DwarfScraper::Result() {
-  ScrapeResult r(stats_);
-  r.source = dwsrc_->GetPath();
+ScraperResult DwarfScraper::result() {
+  ScraperResult r(stats_);
+  r.source = dwsrc_->getPath();
 
   return r;
 }
 
-void DwarfScraper::GetTypeInfo(const llvm::DWARFDie &die, TypeInfo &info) {
-  llvm::raw_string_ostream type_name_stream(info.type_name);
-  llvm::dumpTypeUnqualifiedName(die, type_name_stream);
+// void DwarfScraper::GetTypeInfo(const llvm::DWARFDie &die, TypeInfo &info) {
+//   llvm::raw_string_ostream type_name_stream(info.type_name);
+//   llvm::dumpTypeUnqualifiedName(die, type_name_stream);
 
-  /* Go through the DIE chain */
-  std::vector<llvm::DWARFDie> chain;
-  llvm::DWARFDie next = die;
-  while (next) {
-    chain.push_back(next);
-    next = next.getAttributeValueAsReferencedDie(dwarf::DW_AT_type)
-               .resolveTypeUnitReference();
-  }
+//   /* Go through the DIE chain */
+//   std::vector<llvm::DWARFDie> chain;
+//   llvm::DWARFDie next = die;
+//   while (next) {
+//     chain.push_back(next);
+//     next = next.getAttributeValueAsReferencedDie(dwarf::DW_AT_type)
+//                .resolveTypeUnitReference();
+//   }
 
-  if (chain.size() == 0) {
-    LOG(kError) << "Failed to resolve type for member "
-                << GetStrAttr(die, dwarf::DW_AT_name).value_or("<anonymous>");
-    throw std::runtime_error("Could not resolve type");
-  }
+//   if (chain.size() == 0) {
+//     LOG(kError) << "Failed to resolve type for member "
+//                 << GetStrAttr(die,
+//                 dwarf::DW_AT_name).value_or("<anonymous>");
+//     throw std::runtime_error("Could not resolve type");
+//   }
 
-  for (auto iter_die = chain.rbegin(); iter_die != chain.rend(); ++iter_die) {
-    switch (iter_die->getTag()) {
-    case dwarf::DW_TAG_base_type: {
-      auto size = GetULongAttr(*iter_die, dwarf::DW_AT_byte_size);
-      if (!size) {
-        LOG(kError) << "Found DW_TAG_base_type without a size";
-        throw std::runtime_error("Base type without a size");
-      }
-      info.byte_size = *size;
-      info.type_die = *iter_die;
-      break;
-    }
-    case dwarf::DW_TAG_structure_type:
-    case dwarf::DW_TAG_class_type:
-    case dwarf::DW_TAG_union_type: {
-      using FLIKind = llvm::DILineInfoSpecifier::FileLineInfoKind;
-      info.decl_file = iter_die->getDeclFile(FLIKind::AbsoluteFilePath);
-      if (strip_prefix_) {
-        info.decl_file = fs::relative(*info.decl_file, *strip_prefix_);
-      }
-      info.decl_line = iter_die->getDeclLine();
-      info.decl_name = GetStrAttr(*iter_die, dwarf::DW_AT_name)
-                           .value_or(AnonymousName(*iter_die, strip_prefix_));
+//   for (auto iter_die = chain.rbegin(); iter_die != chain.rend(); ++iter_die)
+//   {
+//     switch (iter_die->getTag()) {
+//     case dwarf::DW_TAG_base_type: {
+//       auto size = GetULongAttr(*iter_die, dwarf::DW_AT_byte_size);
+//       if (!size) {
+//         LOG(kError) << "Found DW_TAG_base_type without a size";
+//         throw std::runtime_error("Base type without a size");
+//       }
+//       info.byte_size = *size;
+//       info.type_die = *iter_die;
+//       break;
+//     }
+//     case dwarf::DW_TAG_structure_type:
+//     case dwarf::DW_TAG_class_type:
+//     case dwarf::DW_TAG_union_type: {
+//       using FLIKind = llvm::DILineInfoSpecifier::FileLineInfoKind;
+//       info.decl_file = iter_die->getDeclFile(FLIKind::AbsoluteFilePath);
+//       if (strip_prefix_) {
+//         info.decl_file = fs::relative(*info.decl_file, *strip_prefix_);
+//       }
+//       info.decl_line = iter_die->getDeclLine();
+//       info.decl_name = GetStrAttr(*iter_die, dwarf::DW_AT_name)
+//                            .value_or(AnonymousName(*iter_die,
+//                            strip_prefix_));
 
-      if (iter_die->getTag() == dwarf::DW_TAG_structure_type) {
-        info.flags |= TypeInfoFlags::kTypeIsStruct;
-      } else if (iter_die->getTag() == dwarf::DW_TAG_class_type) {
-        info.flags |= TypeInfoFlags::kTypeIsClass;
-      } else {
-        info.flags |= TypeInfoFlags::kTypeIsUnion;
-      }
-      if (iter_die->find(dwarf::DW_AT_declaration)) {
-        /*
-         * This only happens when we have a pointer to something,
-         * it is safe to ignore the size here, as the pointer DIE
-         * will set it.
-         */
-        break;
-      }
-      if (!iter_die->find(dwarf::DW_AT_name)) {
-        info.flags |= TypeInfoFlags::kTypeIsAnon;
-        info.type_name = AnonymousName(*iter_die, strip_prefix_);
-      }
-      auto size = GetULongAttr(*iter_die, dwarf::DW_AT_byte_size);
-      if (!size) {
-        LOG(kError) << "Found aggregate type without size";
-        throw std::runtime_error("Aggregate type without size");
-      }
-      info.byte_size = *size;
-      info.type_die = *iter_die;
-      break;
-    }
-    case dwarf::DW_TAG_enumeration_type: {
-      if (iter_die->find(dwarf::DW_AT_declaration)) {
-        LOG(kWarn) << "TODO support enum member type declarations";
-        break;
-      }
-      auto size = GetULongAttr(*iter_die, dwarf::DW_AT_byte_size);
-      if (!size) {
-        LOG(kError) << "Found enum type without a size";
-        throw std::runtime_error("Enum type without a size");
-      }
-      info.byte_size = *size;
-      info.type_die = *iter_die;
+//       if (iter_die->getTag() == dwarf::DW_TAG_structure_type) {
+//         info.flags |= TypeInfoFlags::kTypeIsStruct;
+//       } else if (iter_die->getTag() == dwarf::DW_TAG_class_type) {
+//         info.flags |= TypeInfoFlags::kTypeIsClass;
+//       } else {
+//         info.flags |= TypeInfoFlags::kTypeIsUnion;
+//       }
+//       if (iter_die->find(dwarf::DW_AT_declaration)) {
+//         /*
+//          * This only happens when we have a pointer to something,
+//          * it is safe to ignore the size here, as the pointer DIE
+//          * will set it.
+//          */
+//         break;
+//       }
+//       if (!iter_die->find(dwarf::DW_AT_name)) {
+//         info.flags |= TypeInfoFlags::kTypeIsAnon;
+//         info.type_name = AnonymousName(*iter_die, strip_prefix_);
+//       }
+//       auto size = GetULongAttr(*iter_die, dwarf::DW_AT_byte_size);
+//       if (!size) {
+//         LOG(kError) << "Found aggregate type without size";
+//         throw std::runtime_error("Aggregate type without size");
+//       }
+//       info.byte_size = *size;
+//       info.type_die = *iter_die;
+//       break;
+//     }
+//     case dwarf::DW_TAG_enumeration_type: {
+//       if (iter_die->find(dwarf::DW_AT_declaration)) {
+//         LOG(kWarn) << "TODO support enum member type declarations";
+//         break;
+//       }
+//       auto size = GetULongAttr(*iter_die, dwarf::DW_AT_byte_size);
+//       if (!size) {
+//         LOG(kError) << "Found enum type without a size";
+//         throw std::runtime_error("Enum type without a size");
+//       }
+//       info.byte_size = *size;
+//       info.type_die = *iter_die;
 
-      // If the name exists, it is parsed correctly above
-      // otherwise use our own pattern.
-      if (!iter_die->find(dwarf::DW_AT_name)) {
-        info.flags |= TypeInfoFlags::kTypeIsAnon;
-        info.type_name = AnonymousName(*iter_die, strip_prefix_);
-      }
-      break;
-    }
-    case dwarf::DW_TAG_const_type:
-    case dwarf::DW_TAG_volatile_type:
-      break;
-    case dwarf::DW_TAG_typedef:
-      info.alias_name = GetStrAttr(*iter_die, dwarf::DW_AT_name);
-      if (!info.alias_name) {
-        LOG(kError) << "Invalid typedef, missing type name";
-        throw std::runtime_error("Typedef without name");
-      }
-      break;
-    case dwarf::DW_TAG_reference_type:
-    case dwarf::DW_TAG_rvalue_reference_type:
-    case dwarf::DW_TAG_pointer_type: {
-      info.byte_size = GetULongAttr(*iter_die, dwarf::DW_AT_byte_size)
-                           .value_or(dwsrc_->GetABIPointerSize());
-      if ((info.flags & TypeInfoFlags::kTypeIsFn) == TypeInfoFlags::kTypeNone)
-        info.flags = TypeInfoFlags::kTypeIsPtr;
-      // Reset # of array items, as this is a pointer to an array
-      info.array_items = std::nullopt;
-      break;
-    }
-    case dwarf::DW_TAG_array_type: {
-      llvm::DWARFDie subrange_die =
-          FindFirstChild(*iter_die, dwarf::DW_TAG_subrange_type);
-      if (!subrange_die) {
-        LOG(kError) << "Found DW_TAG_array_type without a subrange DIE";
-        throw std::runtime_error("Array without subrange");
-      }
-      auto count = GetULongAttr(subrange_die, dwarf::DW_AT_count);
-      auto upper_bound = GetULongAttr(subrange_die, dwarf::DW_AT_upper_bound);
-      unsigned long array_items = 0;
-      if (count) {
-        array_items = *count;
-      } else if (upper_bound) {
-        array_items = *upper_bound + 1;
-      }
-      info.array_items = array_items;
-      info.byte_size = info.byte_size * array_items;
-      info.flags = TypeInfoFlags::kTypeIsArray;
-      break;
-    }
-    case dwarf::DW_TAG_subroutine_type: {
-      info.flags |= TypeInfoFlags::kTypeIsFn;
-      info.type_die = *iter_die;
-      break;
-    }
-    default:
-      auto tag_name = dwarf::TagString(iter_die->getTag());
-      LOG(kError) << "Unhandled DIE " << tag_name.str();
-      throw std::runtime_error("Unhandled DIE");
-    }
-  }
-}
+//       // If the name exists, it is parsed correctly above
+//       // otherwise use our own pattern.
+//       if (!iter_die->find(dwarf::DW_AT_name)) {
+//         info.flags |= TypeInfoFlags::kTypeIsAnon;
+//         info.type_name = AnonymousName(*iter_die, strip_prefix_);
+//       }
+//       break;
+//     }
+//     case dwarf::DW_TAG_const_type:
+//     case dwarf::DW_TAG_volatile_type:
+//       break;
+//     case dwarf::DW_TAG_typedef:
+//       info.alias_name = GetStrAttr(*iter_die, dwarf::DW_AT_name);
+//       if (!info.alias_name) {
+//         LOG(kError) << "Invalid typedef, missing type name";
+//         throw std::runtime_error("Typedef without name");
+//       }
+//       break;
+//     case dwarf::DW_TAG_reference_type:
+//     case dwarf::DW_TAG_rvalue_reference_type:
+//     case dwarf::DW_TAG_pointer_type: {
+//       info.byte_size = GetULongAttr(*iter_die, dwarf::DW_AT_byte_size)
+//                            .value_or(dwsrc_->GetABIPointerSize());
+//       if ((info.flags & TypeInfoFlags::kTypeIsFn) ==
+//       TypeInfoFlags::kTypeNone)
+//         info.flags = TypeInfoFlags::kTypeIsPtr;
+//       // Reset # of array items, as this is a pointer to an array
+//       info.array_items = std::nullopt;
+//       break;
+//     }
+//     case dwarf::DW_TAG_array_type: {
+//       llvm::DWARFDie subrange_die =
+//           FindFirstChild(*iter_die, dwarf::DW_TAG_subrange_type);
+//       if (!subrange_die) {
+//         LOG(kError) << "Found DW_TAG_array_type without a subrange DIE";
+//         throw std::runtime_error("Array without subrange");
+//       }
+//       auto count = GetULongAttr(subrange_die, dwarf::DW_AT_count);
+//       auto upper_bound = GetULongAttr(subrange_die,
+//       dwarf::DW_AT_upper_bound); unsigned long array_items = 0; if (count) {
+//         array_items = *count;
+//       } else if (upper_bound) {
+//         array_items = *upper_bound + 1;
+//       }
+//       info.array_items = array_items;
+//       info.byte_size = info.byte_size * array_items;
+//       info.flags = TypeInfoFlags::kTypeIsArray;
+//       break;
+//     }
+//     case dwarf::DW_TAG_subroutine_type: {
+//       info.flags |= TypeInfoFlags::kTypeIsFn;
+//       info.type_die = *iter_die;
+//       break;
+//     }
+//     default:
+//       auto tag_name = dwarf::TagString(iter_die->getTag());
+//       LOG(kError) << "Unhandled DIE " << tag_name.str();
+//       throw std::runtime_error("Unhandled DIE");
+//     }
+//   }
+// }
 
 } /* namespace cheri */

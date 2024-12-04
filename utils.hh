@@ -1,10 +1,14 @@
 #pragma once
 
 #include <concepts>
+#include <filesystem>
 #include <numeric>
 #include <string>
 
 namespace cheri {
+
+QDebug operator<<(QDebug debug, const std::filesystem::path &p);
+
 template <typename T, char S = ','>
 std::string Join(const std::vector<T> &&vec) {
   std::string acc;

@@ -1,20 +1,23 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
-#include <llvm/Support/CommandLine.h>
+#include <QCommandLineParser>
+#include <QCoreApplication>
+#include <QDebug>
+#include <QLoggingCategory>
+#include <QThreadPool>
+#include <QtLogging>
 
-#include "log.hh"
+#include "flat_layout_scraper.hh"
 #include "pool.hh"
 #include "scraper.hh"
-#include "storage.hh"
-#include "struct_layout_scraper.hh"
+#include "utils.hh"
 
 namespace fs = std::filesystem;
-namespace cl = llvm::cl;
 
 namespace {
 
@@ -22,12 +25,12 @@ namespace {
  * Maps command line arguments to an internal identifier for
  * a specific scraper.
  */
-enum class ScraperID { StructLayout };
+enum class ScraperID { FlatLayout, Unset };
 
 std::ostream &operator<<(std::ostream &os, const ScraperID &value) {
   switch (value) {
-  case ScraperID::StructLayout:
-    os << "struct-layout";
+  case ScraperID::FlatLayout:
+    os << "flat-layout";
     break;
   default:
     os << "<unknown-scraper>";
@@ -38,241 +41,176 @@ std::ostream &operator<<(std::ostream &os, const ScraperID &value) {
 /**
  * Helper context for the scraping session
  */
-struct ScrapeContext {
-  using TaskResult = std::optional<cheri::ScrapeResult>;
-  using TaskFuture = std::shared_future<TaskResult>;
+class Driver {
+public:
+  Driver(unsigned long workers, fs::path db_file,
+         std::optional<std::string> path_strip_prefix)
+      : pool_(workers), sm_(db_file), strip_prefix_(path_strip_prefix) {}
 
-  ScrapeContext(unsigned long workers, fs::path db_file)
-      : pool(workers), db_path(db_file) {}
+  void addTarget(fs::path target, ScraperID scraper_id) {
+    auto source = std::make_unique<cheri::DwarfSource>(target);
+    std::unique_ptr<cheri::DwarfScraper> scraper;
+    switch (scraper_id) {
+    case ScraperID::FlatLayout:
+      scraper =
+          std::make_unique<cheri::FlatLayoutScraper>(sm_, std::move(source));
+      break;
+    default:
+      qCritical() << "Unexpected scraper ID";
+      throw std::invalid_argument("Invalid value for scraper_id");
+    }
+    scraper->setStripPrefix(strip_prefix_);
+    results_.emplace_back(pool_.schedule(std::move(scraper)));
+  }
 
+  void waitComplete() { pool_.wait(); }
+
+  bool report() {
+    int has_error = false;
+    for (auto &fut : results_) {
+      auto result = fut.get();
+      qInfo() << result;
+      has_error = has_error || (result.errors.size() > 0);
+      for (auto &err : result.errors) {
+        qCritical() << "Reason: " << err;
+      }
+    }
+    return has_error;
+  }
+
+private:
   /* Thread pool where work is submitted */
-  cheri::ThreadPool pool;
+  cheri::ThreadPool pool_;
   /* Vector of future results */
-  std::vector<TaskFuture> future_results;
+  std::vector<std::future<cheri::ScraperResult>> results_;
   /* Storage manager */
-  fs::path db_path;
+  cheri::StorageManager sm_;
   /* File path prefix to strip */
-  std::optional<std::string> strip_prefix;
-
-  /**
-   * Get the storage manager for the current worker thread.
-   * Note that we use different storage managers so that we have a different
-   * sqlite connection for each thread. This allows to run sqlite in the
-   * multithreaded mode.
-   * See https://www.sqlite.org/threadsafe.html
-   */
-  cheri::StorageManager &GetWorkerStorage() {
-    static thread_local cheri::StorageManager worker_storage(db_path);
-    return worker_storage;
-  }
+  std::optional<std::string> strip_prefix_;
 };
-
-std::unique_ptr<cheri::DwarfScraper>
-MakeScraper(ScraperID id, ScrapeContext &ctx,
-            std::shared_ptr<cheri::DwarfSource> dwsrc) {
-  std::unique_ptr<cheri::DwarfScraper> s;
-  switch (id) {
-  case ScraperID::StructLayout:
-    LOG(cheri::kDebug) << "Build StructLayout scraper for " << dwsrc->GetPath();
-    s = std::make_unique<cheri::StructLayoutScraper>(ctx.GetWorkerStorage(),
-                                                     dwsrc);
-    break;
-  default:
-    throw std::runtime_error("Unexpected scraper ID");
-  }
-  s->SetStripPrefix(ctx.strip_prefix);
-  return std::move(s);
-}
-
-void Scrape(ScrapeContext &ctx, fs::path target,
-            std::vector<ScraperID> *scrapers) {
-  using JobResult = std::optional<cheri::ScrapeResult>;
-  LOG(cheri::kInfo) << "Create DWARF scraping jobs for " << target;
-
-  /* DWARF source is shared among all scrapers, which run concurrently */
-  auto dwsrc = std::make_shared<cheri::DwarfSource>(target);
-
-  for (auto id : *scrapers) {
-    auto future = ctx.pool.Async(
-        [&ctx, dwsrc, id](std::stop_token stop_tok) -> JobResult {
-          try {
-            auto scr = MakeScraper(id, ctx, dwsrc);
-            scr->InitSchema();
-            scr->Extract(stop_tok);
-            LOG(cheri::kInfo) << "Scraper " << id << " completed job for "
-                              << dwsrc->GetPath().string();
-            return scr->Result();
-          } catch (std::exception &ex) {
-            LOG(cheri::kError)
-                << "DWARF scraper failed for " << dwsrc->GetPath().string()
-                << " reason: " << ex.what();
-            return std::nullopt;
-          }
-        });
-    ctx.future_results.emplace_back(future);
-  }
-}
-
-void TryScrape(ScrapeContext &ctx, fs::path target,
-               std::vector<ScraperID> *scrapers) {
-  try {
-    Scrape(ctx, target, scrapers);
-  } catch (std::exception &ex) {
-    LOG(cheri::kError) << "Failed to setup scraping for " << target.string()
-                       << " reason: " << ex.what();
-  }
-}
 
 } // namespace
 
-// clang-format off
-static cl::OptionCategory cat_cheri_scraper("DWARF Scraper Options");
-
-static cl::opt<bool> opt_verbose(
-    "verbose",
-    cl::desc("Enable verbose output"),
-    cl::cat(cat_cheri_scraper));
-static cl::alias alias_verbose(
-    "v",
-    cl::desc("Alias for --verbose"),
-    cl::aliasopt(opt_verbose),
-    cl::cat(cat_cheri_scraper));
-static cl::opt<bool> opt_debug(
-    "trace",
-    cl::desc("Enable extra debug output"),
-    cl::cat(cat_cheri_scraper));
-
-static cl::opt<bool> opt_clean(
-    "clean",
-    cl::desc("Wipe the database clean before running"),
-    cl::cat(cat_cheri_scraper));
-
-static cl::opt<std::string> opt_prefix(
-    "prefix",
-    cl::desc("Path prefix to strip from the source file paths"),
-    cl::cat(cat_cheri_scraper));
-
-static cl::opt<unsigned int> opt_workers(
-    "threads",
-    cl::desc("Use parallel threads for DWARF traversal, (defaults to #CPU)"),
-    cl::init(std::thread::hardware_concurrency()),
-    cl::cat(cat_cheri_scraper));
-static cl::alias alias_workers(
-    "t",
-    cl::desc("Alias for --threads"),
-    cl::aliasopt(opt_workers),
-    cl::cat(cat_cheri_scraper));
-
-static cl::opt<std::string> opt_database(
-    "database",
-    cl::desc("Database file to store the information (defaults to cheri-dwarf.sqlite)"),
-    cl::init("cheri-dwarf.sqlite"),
-    cl::cat(cat_cheri_scraper));
-
-static cl::opt<bool> opt_stdin(
-    "stdin",
-    cl::desc("Read input files from stdin instead of looking for --input options"),
-    cl::cat(cat_cheri_scraper));
-
-static cl::list<std::string> opt_input(
-    "input",
-    cl::desc("Specify input file path(s)"),
-    cl::cat(cat_cheri_scraper));
-static cl::alias alias_input(
-    "i",
-    cl::desc("Alias for --input"),
-    cl::aliasopt(opt_input),
-    cl::cat(cat_cheri_scraper));
-
-static cl::opt<std::string> opt_input_file(
-    "input-file",
-    cl::desc("Read input files list from file"),
-    cl::cat(cat_cheri_scraper));
-
-static cl::list<ScraperID> opt_scrapers(
-    "scrapers",
-    cl::desc("Select the scrapers to run:"),
-    cl::values(
-        clEnumValN(ScraperID::StructLayout, "struct-layout", "Extract structure layouts")),
-    cl::cat(cat_cheri_scraper),
-    cl::Required);
-static cl::alias alias_scrapers(
-    "s",
-    cl::desc("Alias for --scrapers"),
-    cl::aliasopt(opt_scrapers),
-    cl::cat(cat_cheri_scraper));
-// clang-format on
-
 int main(int argc, char **argv) {
-  cheri::Logger &logger = cheri::Logger::Default();
+  using namespace cheri;
 
-  cl::HideUnrelatedOptions(cat_cheri_scraper);
-  cl::ParseCommandLineOptions(argc, argv, "CHERI debug info scraping tool");
+  QCoreApplication app(argc, argv);
+  QCoreApplication::setApplicationName("dwarf-scraper");
+  QCoreApplication::setApplicationVersion("1.0");
 
-  if (opt_verbose) {
-    logger.SetLevel(cheri::kDebug);
+  QCommandLineParser parser;
+  parser.setApplicationDescription("CHERI debug info scraping tool");
+  auto help = parser.addHelpOption();
+  auto version = parser.addVersionOption();
+  QCommandLineOption verbose("verbose", "Enable verbose output");
+  parser.addOption(verbose);
+
+  QCommandLineOption clean("clean", "Wipe the database clean before running");
+  parser.addOption(clean);
+
+  QCommandLineOption prefix(
+      "prefix", "Path prefix to strip from the source file paths", "PREFIX");
+  parser.addOption(prefix);
+
+  QCommandLineOption threads("threads", "Use specified number of threads",
+                             "THREADS");
+  threads.setDefaultValue(QString::number(std::thread::hardware_concurrency()));
+  parser.addOption(threads);
+
+  QCommandLineOption database("database",
+                              "Database file to store the information "
+                              "(defaults to cheri-dwarf.sqlite)",
+                              "PATH");
+  database.setDefaultValue("cheri-dwarf.sqlite");
+  parser.addOption(database);
+
+  QCommandLineOption input_path(QStringList() << "i" << "input",
+                                "Specify input file path", "PATH");
+  parser.addOption(input_path);
+
+  QCommandLineOption read_input("read-input", "Read input files list from file",
+                                "PATH");
+  parser.addOption(read_input);
+
+  parser.addPositionalArgument(
+      "scraper", "Select scraper to run. Valid values are 'flat-layout'");
+
+  parser.process(app);
+
+  if (parser.isSet(version)) {
+    parser.showVersion();
+    return 0;
   }
-  if (opt_debug) {
-    logger.SetLevel(cheri::kTrace);
+
+  if (parser.isSet(help)) {
+    parser.showHelp(0);
   }
 
-  LOG(cheri::kDebug) << "Initialize thread pool with " << opt_workers
-                     << " workers";
-  if (opt_clean) {
-    LOG(cheri::kDebug) << "Wiping database at " << opt_database;
-    auto path = fs::path(opt_database.getValue());
-    if (fs::exists(path)) {
-      fs::remove(path);
+  if (!parser.isSet(verbose)) {
+    QLoggingCategory::setFilterRules("*.debug=false\n");
+  }
+
+  auto args = parser.positionalArguments();
+  if (args.count() < 1) {
+    qCritical() << "Missing positional argument 'scraper'";
+    parser.showHelp(1);
+  }
+  auto scraper_name = args.at(0);
+  ScraperID scraper_id = ScraperID::Unset;
+  if (scraper_name == "flat-layout") {
+    scraper_id = ScraperID::FlatLayout;
+  }
+  if (scraper_id == ScraperID::Unset) {
+    qCritical() << "Invalid scraper name '" << scraper_name << "'"
+                << "Must be one of {'flat-layout'}";
+    parser.showHelp(1);
+  }
+
+  bool ok;
+  int opt_workers = parser.value(threads).toInt(&ok);
+  if (!ok) {
+    qCritical() << "Invalid value for option --threads, must be an integer:"
+                << parser.value(threads);
+    parser.showHelp(/*exitCode=*/1);
+  }
+
+  auto opt_database = fs::path(parser.value(database).toStdString());
+  if (parser.isSet(clean)) {
+    qDebug() << "Wiping database" << opt_database;
+    if (fs::exists(opt_database)) {
+      fs::remove(opt_database);
     }
   }
-  ScrapeContext ctx(opt_workers, fs::path(opt_database.getValue()));
 
-  if (opt_prefix != "") {
-    ctx.strip_prefix = opt_prefix;
+  std::optional<std::string> opt_prefix;
+  if (parser.isSet(prefix)) {
+    opt_prefix = parser.value(prefix).toStdString();
   }
 
-  if (!opt_stdin && opt_input.size() == 0 && opt_input_file.size() == 0) {
-    LOG(cheri::kError) << "At least one of --input, --input_file or --stdin "
-                          "must be specified.";
-    cl::PrintHelpMessage();
-  }
+  qDebug() << "Initialize thread pool with" << opt_workers << "workers";
+  Driver ctx(opt_workers, opt_database, opt_prefix);
 
-  if (opt_stdin) {
-    LOG(cheri::kDebug) << "Reading target files from STDIN";
-    fs::path path;
-    while (std::cin >> path) {
-      TryScrape(ctx, path, &opt_scrapers);
-    }
-    LOG(cheri::kDebug) << "End of inputs";
-  } else if (opt_input_file.size()) {
-    LOG(cheri::kDebug) << "Reading target files from " << opt_input_file;
-    std::ifstream target_stream(opt_input_file);
+  if (parser.isSet(read_input)) {
+    auto input_list = fs::path(parser.value(read_input).toStdString());
+    qDebug() << "Reading target files from" << input_list;
+    std::ifstream target_stream(input_list);
     std::string target;
     while (std::getline(target_stream, target)) {
-      TryScrape(ctx, target, &opt_scrapers);
+      ctx.addTarget(target, scraper_id);
     }
     target_stream.close();
+  } else if (parser.isSet(input_path)) {
+    qDebug() << "Reading target files from --input args";
+    auto input_list = parser.values(input_path);
+    for (auto path : input_list) {
+      ctx.addTarget(path.toStdString(), scraper_id);
+    }
   } else {
-    LOG(cheri::kDebug) << "Reading target files from --input args";
-    for (auto path : opt_input) {
-      TryScrape(ctx, path, &opt_scrapers);
-    }
+    qCritical()
+        << "No input methods specified, use either --input or --read-input.";
   }
-
-  ctx.pool.Join();
-
-  /* Report results */
-  int has_error = 0;
-  for (auto &future_result : ctx.future_results) {
-    auto result = future_result.get();
-    if (result) {
-      LOG(cheri::kInfo) << *result;
-      has_error = has_error || (result->errors.size() > 0);
-      for (auto &err : result->errors) {
-        LOG(cheri::kError) << "Reason: " << err;
-      }
-    }
-  }
+  ctx.waitComplete();
+  bool has_error = ctx.report();
 
   return has_error;
 }

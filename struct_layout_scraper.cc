@@ -613,8 +613,8 @@ StructMemberRow StructLayoutScraper::VisitMember(const llvm::DWARFDie &die,
 
 void StructLayoutScraper::InsertMemberBounds(const MemberBoundsRow &row) {
   auto cursor = insert_member_bounds_query_->TakeCursor();
-  cursor.Bind(row.owner, row.member, row.mindex, row.offset, row.name, row.base, row.top,
-              row.is_imprecise, row.required_precision);
+  cursor.Bind(row.owner, row.member, row.mindex, row.offset, row.name, row.base,
+              row.top, row.is_imprecise, row.required_precision);
   cursor.Run();
 
   LOG(kDebug) << "Record member bounds for " << row.name << std::hex
@@ -706,11 +706,9 @@ void StructLayoutScraper::FindSubobjectCapabilities(StructTypeEntry &entry) {
   std::function<void(StructTypeEntry &, uint64_t, std::string)> FlattenedLayout;
   uint64_t member_index = 0;
 
-  FlattenedLayout = [this, &member_index, &entry, &FlattenedLayout](
-      StructTypeEntry &curr,
-      uint64_t offset,
-      std::string prefix)
-  {
+  FlattenedLayout = [this, &member_index, &entry,
+                     &FlattenedLayout](StructTypeEntry &curr, uint64_t offset,
+                                       std::string prefix) {
     for (auto m : curr.members) {
       MemberBoundsRow mb_row;
       mb_row.owner = entry.data.id;
