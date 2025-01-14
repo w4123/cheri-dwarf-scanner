@@ -12,6 +12,13 @@ namespace {
 using namespace cheri;
 
 /**
+ * Generate unique name for anonymous types.
+ */
+std::string anonymousName(const llvm::DWARFDie &die) {
+  return std::format("<anon@{:#x}>", die.getOffset());
+}
+
+/**
  * Scan basic information about a given DW_TAG_*_type DIE.
  */
 TypeDesc resolveTypeDie(const DwarfSource &dwsrc, const llvm::DWARFDie &die) {
@@ -22,6 +29,7 @@ TypeDesc resolveTypeDie(const DwarfSource &dwsrc, const llvm::DWARFDie &die) {
   llvm::raw_string_ostream type_name_stream(desc.name);
   llvm::dumpTypeUnqualifiedName(die, type_name_stream);
 
+  bool has_typedef = false;
   llvm::DWARFDie iter_die = die;
   std::optional<uint64_t> byte_size;
   uint64_t size_multiplier = 1;
@@ -144,7 +152,8 @@ TypeDesc resolveTypeDie(const DwarfSource &dwsrc, const llvm::DWARFDie &die) {
       break;
     }
     case dwarf::DW_TAG_typedef:
-      // Pass-through the typedef, we don't care.
+      // Signal that the declaration will not be anonymous.
+      has_typedef = true;
       break;
     default:
       auto tag_name = dwarf::TagString(iter_die.getTag());
@@ -170,6 +179,15 @@ TypeDesc resolveTypeDie(const DwarfSource &dwsrc, const llvm::DWARFDie &die) {
   }
 
   desc.byte_size = byte_size.value() * size_multiplier;
+  /*
+   * If this is an anonymous definition, dumpTypeUnqualified name will be of
+   * the form "struct ". Therefore, we generate a unique name based on the
+   * location of the typedef.
+   */
+  if (desc.decl && !desc.decl->name && !has_typedef) {
+    desc.name += anonymousName(desc.decl->type_die);
+    desc.is_anonymous = true;
+  }
   return desc;
 }
 
@@ -327,11 +345,56 @@ bool FlatLayoutScraper::visit_union_type(llvm::DWARFDie &die) {
   return false;
 }
 
-bool FlatLayoutScraper::visit_typedef(llvm::DWARFDie &die) { return false; }
+bool FlatLayoutScraper::visit_typedef(llvm::DWARFDie &die) {
+  auto type_die = die.getAttributeValueAsReferencedDie(dwarf::DW_AT_type)
+                      .resolveTypeUnitReference();
+  if (!type_die) {
+    // Forward declaration
+    return false;
+  }
+
+  auto typedef_name = getStrAttr(die, dwarf::DW_AT_name);
+  if (!typedef_name) {
+    qCritical() << "Invalid typedef, missing type name";
+    throw ScraperError("Typedef without name");
+  }
+
+  /*
+   * We only care about typedefs of an aggregate type definition, not typedefs
+   * of type form `typedef const struct foo bar;`.
+   * We skip typedefs if the immediate type DIE is not a struct, union or class.
+   */
+  std::optional<FlattenedLayout *> layout;
+  switch (type_die.getTag()) {
+  case dwarf::DW_TAG_structure_type:
+    layout = visitCommon(type_die, typedef_name);
+    if (layout) {
+      layout.value()->kind = LayoutKind::Struct;
+    }
+    break;
+  case dwarf::DW_TAG_union_type:
+    layout = visitCommon(type_die, typedef_name);
+    if (layout) {
+      layout.value()->kind = LayoutKind::Union;
+    }
+    break;
+  case dwarf::DW_TAG_class_type:
+    layout = visitCommon(type_die, typedef_name);
+    if (layout) {
+      layout.value()->kind = LayoutKind::Class;
+    }
+    break;
+  default:
+    // Not interested
+    return false;
+  }
+  return false;
+}
 
 std::optional<FlattenedLayout *>
-FlatLayoutScraper::visitCommon(const llvm::DWARFDie &die) {
-  /* Skip declarations, we don't care. */
+FlatLayoutScraper::visitCommon(const llvm::DWARFDie &die,
+                               std::optional<std::string> typedef_name) {
+  // Skip declarations, we don't care.
   if (die.find(dwarf::DW_AT_declaration)) {
     return std::nullopt;
   }
@@ -345,6 +408,15 @@ FlatLayoutScraper::visitCommon(const llvm::DWARFDie &die) {
 
   // Parse the top-level layout.
   TypeDesc td = resolveTypeDie(source(), die);
+  // If a top-level layout is anonymous, we need to be given a name for it.
+  if (td.is_anonymous) {
+    if (!typedef_name) {
+      qWarning() << "Top level anonymous structure without typedef @ "
+                 << die.getOffset();
+    } else {
+      td.name = *typedef_name;
+    }
+  }
   qDebug() << "Scanning top-level type" << td.name;
 
   auto layout = std::make_unique<FlattenedLayout>(td);

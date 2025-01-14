@@ -129,13 +129,15 @@ struct TypeDecl {
  */
 struct TypeDesc {
   TypeDesc(const llvm::DWARFDie &die)
-      : die(die), is_const(false), is_volatile(false), byte_size(0) {}
+      : die(die), is_const(false), is_volatile(false), is_anonymous(false),
+        byte_size(0) {}
 
   llvm::DWARFDie die;
   // Base type information
   std::string name;
   bool is_const;
   bool is_volatile;
+  bool is_anonymous;
   std::optional<PointerKind> pointer;
   std::optional<uint64_t> array_count;
   uint64_t byte_size;
@@ -177,7 +179,9 @@ protected:
    * Common visitor logic for all aggregate types.
    * Returns a reference to the in-memory flattend layout.
    */
-  std::optional<FlattenedLayout *> visitCommon(const llvm::DWARFDie &die);
+  std::optional<FlattenedLayout *>
+  visitCommon(const llvm::DWARFDie &die,
+              std::optional<std::string> typedef_name = std::nullopt);
 
   /**
    * Visit a structure/union/class member DIE
