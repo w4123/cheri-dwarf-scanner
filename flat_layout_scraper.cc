@@ -15,6 +15,7 @@ using namespace cheri;
  * Scan basic information about a given DW_TAG_*_type DIE.
  */
 TypeDesc resolveTypeDie(const DwarfSource &dwsrc, const llvm::DWARFDie &die) {
+  assert(die.isValid() && "Invalid DIE");
   TypeDesc desc(die);
 
   // Resolve the type name in a readable form.
@@ -186,23 +187,21 @@ FlattenedLayout::FlattenedLayout(const TypeDesc &desc) : FlattenedLayout() {
                 << " is not a compound type";
     throw ScraperError("Invalid TypeDesc");
   }
+  auto decl = desc.decl.value();
 
-  // Source file where the structure is defined
-  std::string file;
-  // Line where the structure is defined
-  unsigned long line;
-  // Name of the structure, without considering any typedef
-  std::string name;
-  // Alias (typedef) names for the structure
-  std::optional<std::string> alias_name;
-  // Total size of the structure
-  uint64_t size;
-  // Differentiate struct, union and class types.
-  LayoutKind kind;
+  name = desc.name;
+  size = desc.byte_size;
+  file = decl.file;
+  line = decl.line;
+  if (decl.kind == DeclKind::Struct)
+    kind = LayoutKind::Struct;
+  else if (decl.kind == DeclKind::Class)
+    kind = LayoutKind::Class;
+  else if (decl.kind == DeclKind::Union)
+    kind = LayoutKind::Union;
 }
 
-
-TypeDecl::TypeDecl(const llvm::DWARFDie &die) : line(0) {
+TypeDecl::TypeDecl(const llvm::DWARFDie &die) : type_die(die), line(0) {
   if (die.getTag() == dwarf::DW_TAG_structure_type)
     kind = DeclKind::Struct;
   else if (die.getTag() == dwarf::DW_TAG_union_type)
@@ -219,7 +218,7 @@ void FlatLayoutScraper::initSchema() {
   // clang-format off
   /* Attempt to initialize tables */
   sm_.query("CREATE TABLE IF NOT EXISTS type_layout ("
-            "id INTEGER NOT NULL PRIMARY KEY,"
+            "id INTEGER PRIMARY KEY,"
             // File where the struct is defined
             "file TEXT NOT NULL,"
             // Line where the struct is defined
@@ -232,7 +231,7 @@ void FlatLayoutScraper::initSchema() {
             "UNIQUE(name, file, line, size))");
 
   sm_.query("CREATE TABLE IF NOT EXISTS layout_member ("
-            "id INTEGER NOT NULL PRIMARY KEY,"
+            "id INTEGER PRIMARY KEY,"
             // FK for the corresponding type_layout
             "owner INTEGER NOT NULL,"
             // Fields match the LayoutMember structure
@@ -250,8 +249,6 @@ void FlatLayoutScraper::initSchema() {
             " CHECK(is_pointer >= 0 AND is_pointer <= 1),"
             "is_function INTEGER DEFAULT 0 NOT NULL"
             " CHECK(is_function >= 0 AND is_function <= 1),"
-            "is_array INTEGER DEFAULT 0 NOT NULL"
-            " CHECK(is_array >= 0 AND is_array <= 1),"
             "is_anon INTEGER DEFAULT 0 NOT NULL"
             " CHECK(is_anon >= 0 AND is_anon <= 1),"
             "is_union INTEGER DEFAULT 0 NOT NULL"
@@ -282,6 +279,14 @@ void FlatLayoutScraper::beginUnit(llvm::DWARFDie &unit_die) {
 
 void FlatLayoutScraper::endUnit(llvm::DWARFDie &unit_die) {
   qDebug() << "Done compilation unit" << current_unit_;
+
+  for (auto i = layouts_.begin(); i != layouts_.end(); i++) {
+    std::unique_ptr<FlattenedLayout> layout;
+    std::swap(i->second, layout);
+    recordLayout(std::move(layout));
+  }
+
+  layouts_.clear();
 }
 
 /*
@@ -292,8 +297,10 @@ void FlatLayoutScraper::endUnit(llvm::DWARFDie &unit_die) {
  */
 bool FlatLayoutScraper::visit_structure_type(llvm::DWARFDie &die) {
   if (die.find(dwarf::DW_AT_name)) {
-    visitCommon(die);
-    // layout.kind = LayoutKind::Struct;
+    auto layout = visitCommon(die);
+    if (layout) {
+      layout.value()->kind = LayoutKind::Struct;
+    }
   }
   return false;
 }
@@ -301,8 +308,10 @@ bool FlatLayoutScraper::visit_structure_type(llvm::DWARFDie &die) {
 /* See FlatLayoutScraper::visit_structure_type */
 bool FlatLayoutScraper::visit_class_type(llvm::DWARFDie &die) {
   if (die.find(dwarf::DW_AT_name)) {
-    visitCommon(die);
-    // layout.kind = LayoutKind::Class;
+    auto layout = visitCommon(die);
+    if (layout) {
+      layout.value()->kind = LayoutKind::Class;
+    }
   }
   return false;
 }
@@ -310,15 +319,17 @@ bool FlatLayoutScraper::visit_class_type(llvm::DWARFDie &die) {
 /* See FlatLayoutScraper::visit_structure_type */
 bool FlatLayoutScraper::visit_union_type(llvm::DWARFDie &die) {
   if (die.find(dwarf::DW_AT_name)) {
-    visitCommon(die);
-    // layout.kind = LayoutKind::Union;
+    auto layout = visitCommon(die);
+    if (layout) {
+      layout.value()->kind = LayoutKind::Union;
+    }
   }
   return false;
 }
 
 bool FlatLayoutScraper::visit_typedef(llvm::DWARFDie &die) { return false; }
 
-std::optional<FlattenedLayout>
+std::optional<FlattenedLayout *>
 FlatLayoutScraper::visitCommon(const llvm::DWARFDie &die) {
   /* Skip declarations, we don't care. */
   if (die.find(dwarf::DW_AT_declaration)) {
@@ -334,16 +345,233 @@ FlatLayoutScraper::visitCommon(const llvm::DWARFDie &die) {
 
   // Parse the top-level layout.
   TypeDesc td = resolveTypeDie(source(), die);
-  qInfo() << "Scanning top-level type" << td.name;
+  qDebug() << "Scanning top-level type" << td.name;
 
   auto layout = std::make_unique<FlattenedLayout>(td);
-  // Flatten the description of the type we found.
-  for (auto &child : die.children()) {
-    
+  if (auto search = layouts_.find(layout->id()); search != layouts_.end()) {
+    // We already have the structure, no need to scan it.
+    qDebug() << "Structure" << layout->name << "already present" << layout->file
+             << layout->line;
+    return std::nullopt;
   }
 
-  // auto flp = flatten(die);
-  return std::nullopt;
+  // Flatten the description of the type we found.
+  long member_index = 0;
+  for (auto &child : die.children()) {
+    if (child.getTag() == dwarf::DW_TAG_member) {
+      visitNested(child, layout.get(), td.name, member_index++, /*offset=*/0);
+    }
+  }
+
+  auto [pos, inserted] =
+      layouts_.emplace(std::make_pair(layout->id(), std::move(layout)));
+  assert(inserted && "Could not insert duplicate layout");
+
+  return (*pos).second.get();
+}
+
+/*
+ * Recursively scan through a structure member and attach member
+ * data to the layout.
+ */
+void FlatLayoutScraper::visitNested(const llvm::DWARFDie &die,
+                                    FlattenedLayout *layout, std::string prefix,
+                                    long mindex, unsigned long parent_offset) {
+  /* Skip declarations, we don't care. */
+  if (die.find(dwarf::DW_AT_declaration)) {
+    return;
+  }
+
+  if (die.find(dwarf::DW_AT_specification)) {
+    qCritical() << "Unsupported DW_AT_specification";
+    throw ScraperError("Not implemented");
+  }
+
+  LayoutMember m;
+  auto member_type_die = die.getAttributeValueAsReferencedDie(dwarf::DW_AT_type)
+                             .resolveTypeUnitReference();
+
+  std::string member_name;
+  if (auto tag_name = getStrAttr(die, dwarf::DW_AT_name)) {
+    member_name = tag_name.value();
+  } else {
+    // Anonymous member, use member index to generate unique name
+    member_name = std::format("_anon{}", mindex);
+  }
+  m.name = std::format("{}::{}", prefix, member_name);
+
+  // Relay type information into the member
+  TypeDesc member_desc = resolveTypeDie(source(), member_type_die);
+  m.type_name = member_desc.name;
+  m.byte_size = member_desc.byte_size;
+  auto tag_bit_size = getULongAttr(die, dwarf::DW_AT_bit_size).value_or(0);
+  if (tag_bit_size > std::numeric_limits<decltype(m.bit_size)>::max()) {
+    qCritical() << "Found DW_AT_bit_size overflowing uint8_t";
+    throw ScraperError("Not implemented");
+  }
+  m.bit_size = static_cast<decltype(m.bit_size)>(tag_bit_size);
+
+  m.byte_offset = parent_offset;
+  auto tag_offset = getULongAttr(die, dwarf::DW_AT_data_member_location);
+  auto tag_bit_offset = getULongAttr(die, dwarf::DW_AT_data_bit_offset);
+  // Old-style bit offset deprecated in DWARF v5.
+  auto tag_old_bit_offset = getULongAttr(die, dwarf::DW_AT_bit_offset);
+
+  if (tag_bit_offset && tag_old_bit_offset) {
+    qCritical()
+        << "Can not have both DW_AT_bit_offset and DW_AT_data_bit_offset";
+    throw ScraperError("Invalid member DIE");
+  }
+
+  unsigned long bit_offset = 0;
+  if (tag_old_bit_offset) {
+    if (source().getContext().isLittleEndian()) {
+      auto shift = *tag_old_bit_offset + m.bit_size;
+      bit_offset = m.byte_size * 8 - shift;
+    } else {
+      bit_offset = *tag_old_bit_offset;
+    }
+  } else if (tag_bit_offset) {
+    bit_offset = *tag_bit_offset;
+  }
+  m.bit_offset = bit_offset % 8;
+  m.byte_offset += tag_offset.value_or(0) + bit_offset / 8;
+  m.array_items = member_desc.array_count;
+
+  if (member_desc.pointer) {
+    m.is_pointer = true;
+    if (*member_desc.pointer == PointerKind::Function) {
+      m.is_function = true;
+    }
+  }
+
+  // Determine bounds
+  uint64_t rlen = m.byte_size + (m.bit_size ? 1 : 0);
+  auto [base, length] = source().findRepresentableRange(m.byte_offset, rlen);
+  m.base = base;
+  m.top = base + length;
+  m.required_precision = source().findRequiredPrecision(m.byte_offset, rlen);
+  m.is_imprecise = m.byte_offset != m.base || length != rlen;
+
+  qDebug() << "Traversed member"
+           << std::format("+{:#x}:{} {} {} [{}, {}]", m.byte_offset,
+                          m.bit_offset, m.type_name, m.name, m.base, m.top);
+
+  if (member_desc.decl) {
+    auto decl = *member_desc.decl;
+    if (decl.kind == DeclKind::Union) {
+      m.is_union = true;
+    }
+    // set is_anon
+    layout->members.push_back(m);
+
+    if (decl.kind != DeclKind::Enum) {
+      // Descend into the member
+      long member_index = 0;
+      prefix += "::" + member_name;
+      for (auto &child : decl.type_die.children()) {
+        if (child.getTag() == dwarf::DW_TAG_member) {
+          visitNested(child, layout, prefix, member_index++, m.byte_offset);
+        }
+      }
+    }
+  } else {
+    layout->members.push_back(m);
+  }
+}
+
+void FlatLayoutScraper::recordLayout(std::unique_ptr<FlattenedLayout> layout) {
+  sm_.transaction([&](StorageManager &sm) {
+    qDebug() << "Transaction for" << layout->name;
+
+    // clang-format off
+    auto insert_layout = sm.prepare(
+        "INSERT INTO type_layout (name, file, line, size) "
+        "VALUES (:name, :file, :line, :size) "
+        "ON CONFLICT DO NOTHING RETURNING id");
+
+    auto fetch_layout = sm.prepare(
+        "SELECT id FROM type_layout WHERE "
+        "name = :name AND file = :file AND line = :line AND size = :size");
+
+    auto insert_member = sm.prepare(
+        "INSERT INTO layout_member ("
+        "owner, name, type_name, byte_offset, bit_offset, "
+        "byte_size, bit_size, array_items, "
+        "base, top, required_precision, "
+        "is_pointer, is_function, is_anon, is_union, is_imprecise "
+        ") VALUES ("
+        ":owner, :name, :type_name, :byte_offset, :bit_offset, "
+        ":byte_size, :bit_size, :array_items, "
+        ":base, :top, :required_precision, "
+        ":is_pointer, :is_function, :is_anon, :is_union, :is_imprecise"
+        ") ON CONFLICT DO NOTHING RETURNING id");
+    // clang-format on
+
+    insert_layout.bindValue(":name", QString::fromStdString(layout->name));
+    insert_layout.bindValue(":file", QString::fromStdString(layout->file));
+    insert_layout.bindValue(":line", layout->line);
+    insert_layout.bindValue(":size", layout->size);
+    if (!insert_layout.exec()) {
+      // Failed, abort the transaction
+      qCritical() << "Failed to insert layout:" << insert_layout.lastQuery();
+      throw DBError(insert_layout.lastError());
+    }
+    QVariant layout_id;
+    if (!insert_layout.first()) {
+      fetch_layout.bindValue(":name", QString::fromStdString(layout->name));
+      fetch_layout.bindValue(":file", QString::fromStdString(layout->file));
+      fetch_layout.bindValue(":line", layout->line);
+      fetch_layout.bindValue(":size", layout->size);
+      if (!fetch_layout.exec()) {
+        qCritical() << "Failed to fetch layout ID:"
+                    << insert_layout.lastQuery();
+        throw DBError(insert_layout.lastError());
+      }
+      if (!fetch_layout.first()) {
+        qCritical() << "Layout for existing structure could not be found";
+        throw ScraperError("Unexpected missing type_layout");
+      }
+      layout_id = fetch_layout.value(0);
+      fetch_layout.finish();
+    } else {
+      layout_id = insert_layout.value(0);
+    }
+    insert_layout.finish();
+
+    for (auto &m : layout->members) {
+      insert_member.bindValue(":owner", layout_id);
+      insert_member.bindValue(":name", QString::fromStdString(m.name));
+      insert_member.bindValue(":type_name",
+                              QString::fromStdString(m.type_name));
+      insert_member.bindValue(":byte_offset", m.byte_offset);
+      insert_member.bindValue(":bit_offset", m.bit_offset);
+      insert_member.bindValue(":byte_size", m.byte_size);
+      insert_member.bindValue(":bit_size", m.bit_size);
+      if (m.array_items) {
+        insert_member.bindValue(":array_items", *m.array_items);
+      } else {
+        insert_member.bindValue(":array_items", QVariant::fromValue(nullptr));
+      }
+      insert_member.bindValue(":base", static_cast<unsigned long long>(m.base));
+      insert_member.bindValue(":top", static_cast<unsigned long long>(m.top));
+      insert_member.bindValue(":required_precision", m.required_precision);
+      insert_member.bindValue(":is_pointer", m.is_pointer);
+      insert_member.bindValue(":is_function", m.is_function);
+      insert_member.bindValue(":is_anon", m.is_anon);
+      insert_member.bindValue(":is_union", m.is_union);
+      insert_member.bindValue(":is_imprecise", m.is_imprecise);
+      if (!insert_member.exec()) {
+        // Failed, abort the transaction
+        qCritical() << "Failed to insert layout member:"
+                    << insert_member.lastQuery();
+        throw DBError(insert_member.lastError());
+      }
+      insert_member.finish();
+    }
+
+    qDebug() << "Transaction for" << layout->name << "Done";
+  });
 }
 
 } /* namespace cheri */

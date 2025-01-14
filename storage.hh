@@ -36,7 +36,8 @@ public:
   QSqlDatabase &getWorkerStorage();
 
   QSqlQuery query(const std::string &expr);
-  // QSqlQuery prepare(const std::string &expr);
+  QSqlQuery prepare(const std::string &expr);
+  void transaction(std::function<void(StorageManager &sm)> fn);
 
 private:
   std::filesystem::path db_path_;

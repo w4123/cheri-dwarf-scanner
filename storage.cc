@@ -110,4 +110,22 @@ QSqlQuery StorageManager::query(const std::string &expr) {
   return execQuery(getWorkerStorage(), expr);
 }
 
+QSqlQuery StorageManager::prepare(const std::string &expr) {
+  QSqlQuery q(getWorkerStorage());
+  q.prepare(QString::fromStdString(expr));
+
+  return q;
+}
+
+void StorageManager::transaction(std::function<void(StorageManager &sm)> fn) {
+  try {
+    execQuery(getWorkerStorage(), "BEGIN TRANSACTION");
+    fn(*this);
+    execQuery(getWorkerStorage(), "COMMIT TRANSACTION");
+  } catch (const std::exception &ex) {
+    execQuery(getWorkerStorage(), "ROLLBACK TRANSACTION");
+    throw;
+  }
+}
+
 } /* namespace cheri */

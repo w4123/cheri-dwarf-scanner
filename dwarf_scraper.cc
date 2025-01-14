@@ -132,6 +132,9 @@ int main(int argc, char **argv) {
                                 "PATH");
   parser.addOption(read_input);
 
+  QCommandLineOption read_stdin("read-stdin", "Read input files from stdin");
+  parser.addOption(read_stdin);
+
   parser.addPositionalArgument(
       "scraper", "Select scraper to run. Valid values are 'flat-layout'");
 
@@ -192,7 +195,7 @@ int main(int argc, char **argv) {
 
   if (parser.isSet(read_input)) {
     auto input_list = fs::path(parser.value(read_input).toStdString());
-    qDebug() << "Reading target files from" << input_list;
+    qInfo() << "Reading target files from" << input_list;
     std::ifstream target_stream(input_list);
     std::string target;
     while (std::getline(target_stream, target)) {
@@ -200,10 +203,16 @@ int main(int argc, char **argv) {
     }
     target_stream.close();
   } else if (parser.isSet(input_path)) {
-    qDebug() << "Reading target files from --input args";
+    qInfo() << "Reading target files from --input args";
     auto input_list = parser.values(input_path);
     for (auto path : input_list) {
       ctx.addTarget(path.toStdString(), scraper_id);
+    }
+  } else if (parser.isSet(read_stdin)) {
+    qInfo() << "Reading target files from STDIN";
+    std::string target;
+    while (std::getline(std::cin, target)) {
+      ctx.addTarget(target, scraper_id);
     }
   } else {
     qCritical()

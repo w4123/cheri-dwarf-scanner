@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cstdint>
+#include <unordered_map>
 #include <variant>
 
 #include "scraper.hh"
@@ -20,24 +21,29 @@ enum class LayoutKind {
  * In-memory representation of a member in a flattened layout
  */
 struct LayoutMember {
-  // Fully qualified flattened member name
+  LayoutMember()
+      : byte_size(0), bit_size(0), byte_offset(0), bit_offset(0),
+        is_pointer(false), is_function(false), is_anon(false), is_union(false),
+        is_imprecise(false), base(0), top(0), required_precision(0) {}
+
+  // Qualified flattened member name using :: as separator
   std::string name;
   // Name of the member type
   std::string type_name;
   // Size, in bytes, of the member
-  unsigned long byte_size;
+  unsigned long long byte_size;
   // Fractional bit remainder of the size
   uint8_t bit_size;
   // Offset from the start of the layout
-  unsigned long byte_offset;
+  unsigned long long byte_offset;
   // Fractional bit remainder of the size
   uint8_t bit_offset;
   // Number of array items, if the field is an array
-  std::optional<unsigned long> array_items;
+  // this will be 0 if the array is a flexible array.
+  std::optional<unsigned long long> array_items;
   // Flags used to mark member properties
   bool is_pointer : 1;
   bool is_function : 1;
-  bool is_array : 1;
   bool is_anon : 1;
   bool is_union : 1;
   bool is_imprecise : 1;
@@ -49,23 +55,33 @@ struct LayoutMember {
   short required_precision;
 };
 
+using LayoutId = std::tuple<std::string, size_t>;
+
+struct LayoutHash {
+  std::size_t operator()(const LayoutId &k) const noexcept {
+    std::size_t h0 = std::hash<std::string>{}(std::get<0>(k));
+    std::size_t h1 = std::hash<std::size_t>{}(std::get<1>(k));
+
+    return llvm::hash_combine(h0, h1);
+  }
+};
+
 /**
  * In-memory representation of a flattened structure layout
  */
 struct FlattenedLayout {
   FlattenedLayout() : line(0), size(0), die_offset(0) {}
   FlattenedLayout(const TypeDesc &desc);
+  LayoutId id() const { return std::make_tuple(file, line); }
 
   // Source file where the structure is defined
   std::string file;
   // Line where the structure is defined
-  unsigned long line;
+  unsigned long long line;
   // Name of the structure, without considering any typedef
   std::string name;
-  // Alias (typedef) names for the structure
-  std::optional<std::string> alias_name;
   // Total size of the structure
-  uint64_t size;
+  unsigned long long size;
   // Differentiate struct, union and class types.
   LayoutKind kind;
 
@@ -102,6 +118,7 @@ struct TypeDecl {
   TypeDecl(const llvm::DWARFDie &die);
 
   DeclKind kind;
+  llvm::DWARFDie type_die;
   std::optional<std::string> name;
   std::string file;
   unsigned long line;
@@ -160,39 +177,18 @@ protected:
    * Common visitor logic for all aggregate types.
    * Returns a reference to the in-memory flattend layout.
    */
-  std::optional<FlattenedLayout> visitCommon(const llvm::DWARFDie &die);
-
-
+  std::optional<FlattenedLayout *> visitCommon(const llvm::DWARFDie &die);
 
   /**
    * Visit a structure/union/class member DIE
    */
-  // StructMemberRow visitMember(const llvm::DWARFDie &die,
-  //                             const StructTypeRow &row, int member_index);
+  void visitNested(const llvm::DWARFDie &die, FlattenedLayout *layout,
+                   std::string prefix, long mindex, unsigned long offset);
 
   /**
-   * Compute sub-object member capabilities for all nested members of
-   * a given type. The type is assumed to have been fully evaluated
-   * and we have DB entries for all nested members.
+   * Insert a flattened layout into the database.
    */
-  // void findSubobjectCapabilities(StructTypeEntry &entry);
-
-  /**
-   * Insert a new struct layout into the layouts table.
-   * Returns true if a new row was inserted.
-   */
-  // bool insertStructLayout(StructTypeRow &row);
-
-  /**
-   * Insert a new struct member into the members table.
-   * Returns true if a new row was inserted.
-   */
-  // void insertStructMember(StructMemberRow &row);
-
-  /**
-   * Insert a new record in the member_bounds table.
-   */
-  // void InsertMemberBounds(const MemberBoundsRow &row);
+  void recordLayout(std::unique_ptr<FlattenedLayout> layout);
 
   /**
    * Compilation unit currently being scanned
@@ -200,25 +196,14 @@ protected:
   std::string current_unit_;
 
   /**
-   * Structure descriptor entries.
-   * Vector containing the StructTypeEntry descriptors for the current
-   * compilation unit.
+   * Flattened layouts.
+   * Associate a (file, line) tuple to each flattened layout.
+   * It is assumed that the (file, line) tuple is uniquely indentifying a
+   * structure layout. Associate a (file, line) tuple to a set of entries
+   * defined at that source location.
    */
-  // std::vector<std::shared_ptr<StructTypeEntry>> record_descriptors_;
-
-  /**
-   * Index for the structure descriptor entries.
-   * Associate a (file, line) tuple to a set of entries defined at
-   * that source location.
-   */
-  // std::unordered_map<SourceLoc, SourceEntrySet, SourceLocHash> source_map_;
-
-  /**
-   * Index for the structure descriptor entries.
-   * Map local structure type IDs to StructTypeEntry objects.
-   */
-  // std::unordered_map<uint64_t, std::shared_ptr<StructTypeEntry>>
-  // entry_by_id_;
+  std::unordered_map<LayoutId, std::unique_ptr<FlattenedLayout>, LayoutHash>
+      layouts_;
 };
 
 } /* namespace cheri */
