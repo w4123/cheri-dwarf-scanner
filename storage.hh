@@ -2,6 +2,7 @@
 #pragma once
 
 #include <filesystem>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 
@@ -16,7 +17,12 @@ Q_DECLARE_LOGGING_CATEGORY(storage)
 
 class DBError : public std::runtime_error {
 public:
-  DBError(QSqlError err) : std::runtime_error(err.text().toStdString()) {}
+  DBError(QSqlError err)
+      : std::runtime_error(
+            (err.nativeErrorCode() + ": " + err.text()).toStdString()),
+        error(err) {}
+
+  QSqlError error;
 };
 
 /**
@@ -40,6 +46,7 @@ public:
   void transaction(std::function<void(StorageManager &sm)> fn);
 
 private:
+  std::mutex transaction_mutex_;
   std::filesystem::path db_path_;
 };
 

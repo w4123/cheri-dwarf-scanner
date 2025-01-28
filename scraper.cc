@@ -83,10 +83,6 @@ QDebug operator<<(QDebug debug, const ScraperResult &sr) {
   QDebugStateSaver saver(debug);
   QDebug stream = debug.nospace();
   stream << "Result for " << sr.source << ":";
-  // for (auto &prof : sr.profile) {
-  //   stream << " |" << prof.first << "> #" << prof.second.events
-  //          << " avg:" << prof.second.avg;
-  // }
   if (sr.errors.size()) {
     stream << " (WITH ERRORS)";
   }
@@ -249,6 +245,13 @@ void DwarfScraper::run(std::stop_token stop_tok) {
     }
     endUnit(unit_die);
   }
+}
+
+fs::path DwarfScraper::normalizePath(fs::path path) {
+  if (strip_prefix_) {
+    path = fs::relative(path, *strip_prefix_);
+  }
+  return path;
 }
 
 ScraperResult DwarfScraper::result() {

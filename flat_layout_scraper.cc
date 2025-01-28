@@ -18,179 +18,6 @@ std::string anonymousName(const llvm::DWARFDie &die) {
   return std::format("<anon@{:#x}>", die.getOffset());
 }
 
-/**
- * Scan basic information about a given DW_TAG_*_type DIE.
- */
-TypeDesc resolveTypeDie(const DwarfSource &dwsrc, const llvm::DWARFDie &die) {
-  assert(die.isValid() && "Invalid DIE");
-  TypeDesc desc(die);
-
-  // Resolve the type name in a readable form.
-  llvm::raw_string_ostream type_name_stream(desc.name);
-  llvm::dumpTypeUnqualifiedName(die, type_name_stream);
-
-  bool has_typedef = false;
-  llvm::DWARFDie iter_die = die;
-  std::optional<uint64_t> byte_size;
-  uint64_t size_multiplier = 1;
-  while (iter_die) {
-    switch (iter_die.getTag()) {
-    case dwarf::DW_TAG_const_type:
-      desc.is_const = true;
-      break;
-    case dwarf::DW_TAG_volatile_type:
-      desc.is_volatile = true;
-      break;
-    case dwarf::DW_TAG_base_type: {
-      auto size = getULongAttr(iter_die, dwarf::DW_AT_byte_size);
-      if (!size) {
-        qCritical() << "Found DW_TAG_base_type without a size";
-        throw ScraperError("Base type without a size");
-      }
-      if (!byte_size)
-        byte_size = *size;
-      break;
-    }
-    case dwarf::DW_TAG_reference_type:
-    case dwarf::DW_TAG_rvalue_reference_type:
-      desc.pointer = PointerKind::Reference;
-      /* fallthrough */
-    case dwarf::DW_TAG_pointer_type: {
-      auto size = getULongAttr(iter_die, dwarf::DW_AT_byte_size)
-                      .value_or(dwsrc.getABIPointerSize());
-      if (!byte_size)
-        byte_size = size;
-      if (!desc.pointer)
-        desc.pointer = PointerKind::Pointer;
-      break;
-    }
-    case dwarf::DW_TAG_subroutine_type: {
-      desc.pointer = PointerKind::Function;
-      break;
-    }
-    case dwarf::DW_TAG_array_type: {
-      // Find the first child DIE with TAG subrange_type;
-      // this contains the number of items in the array.
-      if (iter_die.find(dwarf::DW_AT_byte_stride) ||
-          iter_die.find(dwarf::DW_AT_bit_stride)) {
-        qCritical()
-            << "Unsupported attributes DW_AT_{byte, bit}_stride on arrays";
-        throw ScraperError("Not implemented");
-      }
-      if (iter_die.find(dwarf::DW_AT_bit_size)) {
-        qCritical() << "Unsupported attribute DW_AT_bit_size on arrays";
-        throw ScraperError("Not implemented");
-      }
-
-      // If this is a pointer type to something, we don't care about
-      // the array information because it is erased by the pointerness.
-      assert(!desc.pointer &&
-             "Unexpectedly reached DW_TAG_array_type with a pointer");
-
-      // Every subrange die describes an array dimension.
-      // Note that only the last one may be without a size in C.
-      std::optional<uint64_t> array_count;
-      for (auto &child : iter_die) {
-        if (child.getTag() != dwarf::DW_TAG_subrange_type) {
-          break;
-        }
-        auto count = getULongAttr(child, dwarf::DW_AT_count);
-        auto upper_bound = getULongAttr(child, dwarf::DW_AT_upper_bound);
-        if (count) {
-          array_count = array_count.value_or(1) * (*count);
-        } else if (upper_bound) {
-          array_count = array_count.value_or(1) * (*upper_bound + 1);
-        } else {
-          // No size given, assume 0
-          array_count = 0;
-        }
-      }
-
-      if (!array_count) {
-        qCritical() << "Found DW_TAG_array_type without a subrange DIE";
-        throw ScraperError("Array without subrange");
-      }
-      desc.array_count = array_count;
-
-      auto arr_bytes = getULongAttr(iter_die, dwarf::DW_AT_byte_size);
-      if (arr_bytes && !byte_size) {
-        // Override type size calculation as we already know the size
-        byte_size = *arr_bytes;
-      } else {
-        size_multiplier = array_count.value();
-      }
-      break;
-    }
-    case dwarf::DW_TAG_structure_type:
-    case dwarf::DW_TAG_class_type:
-    case dwarf::DW_TAG_enumeration_type:
-    case dwarf::DW_TAG_union_type: {
-      using FLIKind = llvm::DILineInfoSpecifier::FileLineInfoKind;
-      TypeDecl decl(iter_die);
-      decl.file = iter_die.getDeclFile(FLIKind::AbsoluteFilePath);
-      decl.line = iter_die.getDeclLine();
-      decl.name = getStrAttr(iter_die, dwarf::DW_AT_name);
-      desc.decl = decl;
-
-      /*
-       * This only happens when we have a pointer to something,
-       * it is safe to ignore the size here, as the pointer DIE
-       * will set it.
-       * Note that in this case this should not be reached.
-       */
-      assert(!iter_die.find(dwarf::DW_AT_declaration));
-
-      auto size = getULongAttr(iter_die, dwarf::DW_AT_byte_size);
-      if (!size) {
-        auto tag_name = dwarf::TagString(iter_die.getTag());
-        qCritical() << "Found aggregate type without size at DIE"
-                    << tag_name.str();
-        throw ScraperError("Aggregate type without size");
-      }
-      if (!byte_size)
-        byte_size = *size;
-      break;
-    }
-    case dwarf::DW_TAG_typedef:
-      // Signal that the declaration will not be anonymous.
-      has_typedef = true;
-      break;
-    default:
-      auto tag_name = dwarf::TagString(iter_die.getTag());
-      qCritical() << "Unhandled DIE " << tag_name.str();
-      throw ScraperError("Unhandled DIE");
-    }
-
-    // If we reached a pointer type, stop scanning.
-    // We don't care about the rest, as the pointer forces the size to be
-    // a pointer size.
-    if (desc.pointer) {
-      break;
-    }
-
-    iter_die = iter_die.getAttributeValueAsReferencedDie(dwarf::DW_AT_type)
-                   .resolveTypeUnitReference();
-  }
-
-  if (!byte_size) {
-    qCritical() << "Failed to resolve type description for DIE @"
-                << die.getOffset();
-    throw ScraperError("Failed to resolve type description");
-  }
-
-  desc.byte_size = byte_size.value() * size_multiplier;
-  /*
-   * If this is an anonymous definition, dumpTypeUnqualified name will be of
-   * the form "struct ". Therefore, we generate a unique name based on the
-   * location of the typedef.
-   */
-  if (desc.decl && !desc.decl->name && !has_typedef) {
-    desc.name += anonymousName(desc.decl->type_die);
-    desc.is_anonymous = true;
-  }
-  return desc;
-}
-
 }; // namespace
 
 namespace cheri {
@@ -246,6 +73,9 @@ void FlatLayoutScraper::initSchema() {
             "name TEXT NOT NULL,"
             // Size of the strucutre including any padding
             "size INTEGER NOT NULL,"
+            // Whether the type is a struct, union or not
+            "is_union INTEGER DEFAULT 0 NOT NULL"
+            " CHECK(is_union >= 0 AND is_union <= 1),"
             "UNIQUE(name, file, line, size))");
 
   sm_.query("CREATE TABLE IF NOT EXISTS layout_member ("
@@ -391,6 +221,180 @@ bool FlatLayoutScraper::visit_typedef(llvm::DWARFDie &die) {
   return false;
 }
 
+/**
+ * Scan basic information about a given DW_TAG_*_type DIE.
+ */
+TypeDesc FlatLayoutScraper::resolveTypeDie(const llvm::DWARFDie &die) {
+  assert(die.isValid() && "Invalid DIE");
+  TypeDesc desc(die);
+
+  // Resolve the type name in a readable form.
+  llvm::raw_string_ostream type_name_stream(desc.name);
+  llvm::dumpTypeUnqualifiedName(die, type_name_stream);
+
+  bool has_typedef = false;
+  llvm::DWARFDie iter_die = die;
+  std::optional<uint64_t> byte_size;
+  uint64_t size_multiplier = 1;
+  while (iter_die) {
+    switch (iter_die.getTag()) {
+    case dwarf::DW_TAG_const_type:
+      desc.is_const = true;
+      break;
+    case dwarf::DW_TAG_volatile_type:
+      desc.is_volatile = true;
+      break;
+    case dwarf::DW_TAG_base_type: {
+      auto size = getULongAttr(iter_die, dwarf::DW_AT_byte_size);
+      if (!size) {
+        qCritical() << "Found DW_TAG_base_type without a size";
+        throw ScraperError("Base type without a size");
+      }
+      if (!byte_size)
+        byte_size = *size;
+      break;
+    }
+    case dwarf::DW_TAG_reference_type:
+    case dwarf::DW_TAG_rvalue_reference_type:
+      desc.pointer = PointerKind::Reference;
+      /* fallthrough */
+    case dwarf::DW_TAG_pointer_type: {
+      auto size = getULongAttr(iter_die, dwarf::DW_AT_byte_size)
+                      .value_or(source().getABIPointerSize());
+      if (!byte_size)
+        byte_size = size;
+      if (!desc.pointer)
+        desc.pointer = PointerKind::Pointer;
+      break;
+    }
+    case dwarf::DW_TAG_subroutine_type: {
+      desc.pointer = PointerKind::Function;
+      break;
+    }
+    case dwarf::DW_TAG_array_type: {
+      // Find the first child DIE with TAG subrange_type;
+      // this contains the number of items in the array.
+      if (iter_die.find(dwarf::DW_AT_byte_stride) ||
+          iter_die.find(dwarf::DW_AT_bit_stride)) {
+        qCritical()
+            << "Unsupported attributes DW_AT_{byte, bit}_stride on arrays";
+        throw ScraperError("Not implemented");
+      }
+      if (iter_die.find(dwarf::DW_AT_bit_size)) {
+        qCritical() << "Unsupported attribute DW_AT_bit_size on arrays";
+        throw ScraperError("Not implemented");
+      }
+
+      // If this is a pointer type to something, we don't care about
+      // the array information because it is erased by the pointerness.
+      assert(!desc.pointer &&
+             "Unexpectedly reached DW_TAG_array_type with a pointer");
+
+      // Every subrange die describes an array dimension.
+      // Note that only the last one may be without a size in C.
+      std::optional<uint64_t> array_count;
+      for (auto &child : iter_die) {
+        if (child.getTag() != dwarf::DW_TAG_subrange_type) {
+          break;
+        }
+        auto count = getULongAttr(child, dwarf::DW_AT_count);
+        auto upper_bound = getULongAttr(child, dwarf::DW_AT_upper_bound);
+        if (count) {
+          array_count = array_count.value_or(1) * (*count);
+        } else if (upper_bound) {
+          array_count = array_count.value_or(1) * (*upper_bound + 1);
+        } else {
+          // No size given, assume 0
+          array_count = 0;
+        }
+      }
+
+      if (!array_count) {
+        qCritical() << "Found DW_TAG_array_type without a subrange DIE";
+        throw ScraperError("Array without subrange");
+      }
+      desc.array_count = array_count;
+
+      auto arr_bytes = getULongAttr(iter_die, dwarf::DW_AT_byte_size);
+      if (arr_bytes && !byte_size) {
+        // Override type size calculation as we already know the size
+        byte_size = *arr_bytes;
+      } else {
+        size_multiplier = array_count.value();
+      }
+      break;
+    }
+    case dwarf::DW_TAG_structure_type:
+    case dwarf::DW_TAG_class_type:
+    case dwarf::DW_TAG_enumeration_type:
+    case dwarf::DW_TAG_union_type: {
+      using FLIKind = llvm::DILineInfoSpecifier::FileLineInfoKind;
+      TypeDecl decl(iter_die);
+      decl.file =
+          normalizePath(iter_die.getDeclFile(FLIKind::AbsoluteFilePath));
+      decl.line = iter_die.getDeclLine();
+      decl.name = getStrAttr(iter_die, dwarf::DW_AT_name);
+      desc.decl = decl;
+
+      /*
+       * This only happens when we have a pointer to something,
+       * it is safe to ignore the size here, as the pointer DIE
+       * will set it.
+       * Note that in this case this should not be reached.
+       */
+      assert(!iter_die.find(dwarf::DW_AT_declaration));
+
+      auto size = getULongAttr(iter_die, dwarf::DW_AT_byte_size);
+      if (!size) {
+        auto tag_name = dwarf::TagString(iter_die.getTag());
+        qCritical() << "Found aggregate type without size at DIE"
+                    << tag_name.str();
+        throw ScraperError("Aggregate type without size");
+      }
+      if (!byte_size)
+        byte_size = *size;
+      break;
+    }
+    case dwarf::DW_TAG_typedef:
+      // Signal that the declaration will not be anonymous.
+      has_typedef = true;
+      break;
+    default:
+      auto tag_name = dwarf::TagString(iter_die.getTag());
+      qCritical() << "Unhandled DIE " << tag_name.str();
+      throw ScraperError("Unhandled DIE");
+    }
+
+    // If we reached a pointer type, stop scanning.
+    // We don't care about the rest, as the pointer forces the size to be
+    // a pointer size.
+    if (desc.pointer) {
+      break;
+    }
+
+    iter_die = iter_die.getAttributeValueAsReferencedDie(dwarf::DW_AT_type)
+                   .resolveTypeUnitReference();
+  }
+
+  if (!byte_size) {
+    qCritical() << "Failed to resolve type description for DIE @"
+                << die.getOffset();
+    throw ScraperError("Failed to resolve type description");
+  }
+
+  desc.byte_size = byte_size.value() * size_multiplier;
+  /*
+   * If this is an anonymous definition, dumpTypeUnqualified name will be of
+   * the form "struct ". Therefore, we generate a unique name based on the
+   * location of the typedef.
+   */
+  if (desc.decl && !desc.decl->name && !has_typedef) {
+    desc.name += anonymousName(desc.decl->type_die);
+    desc.is_anonymous = true;
+  }
+  return desc;
+}
+
 std::optional<FlattenedLayout *>
 FlatLayoutScraper::visitCommon(const llvm::DWARFDie &die,
                                std::optional<std::string> typedef_name) {
@@ -407,7 +411,7 @@ FlatLayoutScraper::visitCommon(const llvm::DWARFDie &die,
   }
 
   // Parse the top-level layout.
-  TypeDesc td = resolveTypeDie(source(), die);
+  TypeDesc td = resolveTypeDie(die);
   // If a top-level layout is anonymous, we need to be given a name for it.
   if (td.is_anonymous) {
     if (!typedef_name) {
@@ -473,7 +477,7 @@ void FlatLayoutScraper::visitNested(const llvm::DWARFDie &die,
   m.name = std::format("{}::{}", prefix, member_name);
 
   // Relay type information into the member
-  TypeDesc member_desc = resolveTypeDie(source(), member_type_die);
+  TypeDesc member_desc = resolveTypeDie(member_type_die);
   m.type_name = member_desc.name;
   m.byte_size = member_desc.byte_size;
   auto tag_bit_size = getULongAttr(die, dwarf::DW_AT_bit_size).value_or(0);
@@ -558,8 +562,8 @@ void FlatLayoutScraper::recordLayout(std::unique_ptr<FlattenedLayout> layout) {
 
     // clang-format off
     auto insert_layout = sm.prepare(
-        "INSERT INTO type_layout (name, file, line, size) "
-        "VALUES (:name, :file, :line, :size) "
+        "INSERT INTO type_layout (name, file, line, size, is_union) "
+        "VALUES (:name, :file, :line, :size, :is_union) "
         "ON CONFLICT DO NOTHING RETURNING id");
 
     auto fetch_layout = sm.prepare(
@@ -584,6 +588,11 @@ void FlatLayoutScraper::recordLayout(std::unique_ptr<FlattenedLayout> layout) {
     insert_layout.bindValue(":file", QString::fromStdString(layout->file));
     insert_layout.bindValue(":line", layout->line);
     insert_layout.bindValue(":size", layout->size);
+    if (layout->kind == LayoutKind::Union) {
+      insert_layout.bindValue(":is_union", 1ULL);
+    } else {
+      insert_layout.bindValue(":is_union", 0ULL);
+    }
     if (!insert_layout.exec()) {
       // Failed, abort the transaction
       qCritical() << "Failed to insert layout:" << insert_layout.lastQuery();

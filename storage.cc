@@ -1,6 +1,5 @@
 #include <cassert>
 #include <condition_variable>
-#include <mutex>
 #include <thread>
 
 #include <QDebug>
@@ -118,6 +117,8 @@ QSqlQuery StorageManager::prepare(const std::string &expr) {
 }
 
 void StorageManager::transaction(std::function<void(StorageManager &sm)> fn) {
+  std::lock_guard tx_lock(transaction_mutex_);
+
   try {
     execQuery(getWorkerStorage(), "BEGIN TRANSACTION");
     fn(*this);

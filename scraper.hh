@@ -170,19 +170,6 @@ public:
   virtual void initSchema() = 0;
 
 protected:
-  // /**
-  //  * Helper to resolve a type definition given a Die with a DW_AT_type
-  //  attribute
-  //  */
-  // void GetTypeInfo(const llvm::DWARFDie &die, TypeInfo &info);
-
-  // TypeInfo GetTypeInfo(const llvm::DWARFDie &die) {
-  //   TypeInfo info;
-
-  //   GetTypeInfo(die, info);
-  //   return info;
-  // }
-
   /* Subclasses must implement this to properly invoke VisitDispatch */
   virtual bool doVisit(llvm::DWARFDie &die) = 0;
 
@@ -191,6 +178,12 @@ protected:
    */
   virtual void beginUnit(llvm::DWARFDie &unit_die) = 0;
   virtual void endUnit(llvm::DWARFDie &unit_die) = 0;
+
+  /**
+   * Given an absolute path from the DWARF information, apply
+   * transformations to normalize it for the database.
+   */
+  std::filesystem::path normalizePath(std::filesystem::path path);
 
   /**
    * Reference to the shared storage manager that provides per-thread

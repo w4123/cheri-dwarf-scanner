@@ -175,6 +175,8 @@ protected:
     return impl::visitDispatch(*this, die);
   }
 
+  TypeDesc resolveTypeDie(const llvm::DWARFDie &die);
+
   /**
    * Common visitor logic for all aggregate types.
    * Returns a reference to the in-memory flattend layout.
