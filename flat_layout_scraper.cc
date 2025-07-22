@@ -510,8 +510,8 @@ void FlatLayoutScraper::visitNested(const llvm::DWARFDie &die,
   } else if (tag_bit_offset) {
     bit_offset = *tag_bit_offset;
   }
-  m.bit_offset = bit_offset % 8;
-  m.byte_offset += tag_offset.value_or(0) + bit_offset / 8;
+  m.bit_offset = bit_offset;
+  m.byte_offset += tag_offset.value_or(0);
   m.array_items = member_desc.array_count;
 
   if (member_desc.pointer) {
