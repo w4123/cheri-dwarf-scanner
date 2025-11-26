@@ -557,8 +557,9 @@ void FlatLayoutScraper::visitNested(const llvm::DWARFDie &die,
   m.is_imprecise = m.byte_offset != m.base || length != rlen;
 
   qDebug() << "Traversed member"
-           << std::format("+{:#x}:{} {} {} [{}, {}]", m.byte_offset,
-                          m.bit_offset, m.type_name, m.name, m.base, m.top);
+           << std::format("+{:#x}:{} {} {} ({:#x}) -> [{:#x}, {:#x}] {}",
+                          m.byte_offset, m.bit_offset, m.type_name, m.name,
+                          rlen, m.base, m.top, m.is_imprecise ? "I" : "P");
 
   if (member_desc.decl) {
     auto decl = *member_desc.decl;
