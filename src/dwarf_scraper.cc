@@ -28,6 +28,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -54,6 +55,12 @@ namespace {
  */
 enum class ScraperID { FlatLayout, Unset };
 
+/**
+ * Log stream, can be a file or stderr.
+ */
+static std::mutex log_mutex;
+static std::ostream *log_stream = nullptr;
+
 std::ostream &operator<<(std::ostream &os, const ScraperID &value) {
   switch (value) {
   case ScraperID::FlatLayout:
@@ -63,6 +70,15 @@ std::ostream &operator<<(std::ostream &os, const ScraperID &value) {
     os << "<unknown-scraper>";
   }
   return os;
+}
+
+void logHandler(QtMsgType type, const QMessageLogContext &context,
+                const QString &msg) {
+  QString message = qFormatLogMessage(type, context, msg);
+  std::lock_guard<std::mutex> lock(log_mutex);
+
+  if (log_stream)
+    *log_stream << message.toStdString() << std::endl;
 }
 
 /**
@@ -132,7 +148,8 @@ int main(int argc, char **argv) {
   QCommandLineOption verbose("verbose", "Enable verbose output");
   parser.addOption(verbose);
 
-  QCommandLineOption logfile("log", "Write log output to file instead of stderr");
+  QCommandLineOption logfile(
+      "log", "Write log output to file instead of stderr", "LOGFILE");
   parser.addOption(logfile);
 
   QCommandLineOption clean("clean", "Wipe the database clean before running");
@@ -182,6 +199,13 @@ int main(int argc, char **argv) {
   if (!parser.isSet(verbose)) {
     QLoggingCategory::setFilterRules("*.debug=false\n");
   }
+  if (parser.isSet(logfile)) {
+    log_stream = new std::ofstream(parser.value(logfile).toStdString(),
+                                   std::ios::out | std::ios::app);
+  } else {
+    log_stream = &std::cerr;
+  }
+  qInstallMessageHandler(logHandler);
 
   auto args = parser.positionalArguments();
   if (args.count() < 1) {
