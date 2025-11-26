@@ -132,6 +132,9 @@ int main(int argc, char **argv) {
   QCommandLineOption verbose("verbose", "Enable verbose output");
   parser.addOption(verbose);
 
+  QCommandLineOption logfile("log", "Write log output to file instead of stderr");
+  parser.addOption(logfile);
+
   QCommandLineOption clean("clean", "Wipe the database clean before running");
   parser.addOption(clean);
 
