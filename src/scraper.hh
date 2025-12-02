@@ -76,6 +76,59 @@ bool visitDispatch(S &scraper, llvm::DWARFDie &die)
 } /* namespace impl */
 
 /**
+ * Indicates the type represented by a TypeDecl.
+ */
+enum class DeclKind {
+  Struct = 1,
+  Class = 2,
+  Union = 3,
+  Enum = 4,
+};
+
+/**
+ * Internal description of a struct, union, class or enum declaration.
+ */
+struct TypeDecl {
+  TypeDecl(const llvm::DWARFDie &die);
+
+  DeclKind kind;
+  llvm::DWARFDie type_die;
+  std::optional<std::string> name;
+  std::string file;
+  unsigned long line;
+};
+
+/**
+ * Indicates whether a TypeDesc is a pointer.
+ */
+enum class PointerKind {
+  Pointer = 1,
+  Reference = 2,
+  Function = 3,
+};
+
+/**
+ * Internal type description helper
+ */
+struct TypeDesc {
+  TypeDesc(const llvm::DWARFDie &die)
+      : die(die), is_const(false), is_volatile(false), is_anonymous(false),
+        byte_size(0) {}
+
+  llvm::DWARFDie die;
+  // Base type information
+  std::string name;
+  bool is_const;
+  bool is_volatile;
+  bool is_anonymous;
+  std::optional<PointerKind> pointer;
+  std::optional<uint64_t> array_count;
+  uint64_t byte_size;
+  // Compound type definition information
+  std::optional<TypeDecl> decl;
+};
+
+/**
  * Scraper execution result.
  */
 struct ScraperResult {
@@ -106,8 +159,16 @@ struct ScraperError : std::runtime_error {
   ScraperError(const std::string &msg) : std::runtime_error(msg) {}
 };
 
+/**
+ * Generate unique name for anonymous types.
+ */
+std::string anonymousName(const llvm::DWARFDie &die);
+
+/** Helper to extract an attribute as ulong */
 std::optional<unsigned long> getULongAttr(const llvm::DWARFDie &die,
                                           llvm::dwarf::Attribute attr);
+
+/** Helper to extract an attribute as string */
 std::optional<std::string> getStrAttr(const llvm::DWARFDie &die,
                                       llvm::dwarf::Attribute attr);
 
@@ -124,6 +185,7 @@ public:
   int getABICapabilitySize() const;
   std::pair<uint64_t, uint64_t> findRepresentableRange(uint64_t base,
                                                        uint64_t length) const;
+  uint64_t findRepresentableAlign(uint64_t length) const;
   /**
    * This should produce the mantissa size required to precisely
    * represent a (base, length) pair in the Cheri compressed capability
@@ -188,6 +250,12 @@ public:
   void setStripPrefix(std::optional<std::string> prefix) {
     strip_prefix_ = prefix;
   }
+
+  /**
+   * Resolve the type description information associated with a DIE.
+   * The DIE must be a DW_TAG_*_type DIE.
+   */
+  TypeDesc resolveTypeDie(const llvm::DWARFDie &die);
 
   /**
    * Hook to initialize the storage schema.

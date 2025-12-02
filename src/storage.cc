@@ -126,6 +126,11 @@ Q_LOGGING_CATEGORY(storage, "storage")
 
 StorageManager::StorageManager(fs::path db_path) : db_path_(db_path) {}
 
+StorageManager::~StorageManager() {
+  // Ensure that we drain the WAL
+  execQuery(getWorkerStorage(), "PRAGMA wal_checkpoint(FULL);");
+}
+
 QSqlDatabase &StorageManager::getWorkerStorage() {
   static thread_local WorkerDB worker_db(db_path_);
 

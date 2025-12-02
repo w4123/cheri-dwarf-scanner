@@ -18,6 +18,7 @@ find_package(Qt6 REQUIRED COMPONENTS Core Sql)
 qt_standard_project_setup()
 
 add_library(dwarf_scraper_lib
+  "global_sym_scraper.cc"
   "flat_layout_scraper.cc"
   "scraper.cc"
   "storage.cc"

@@ -41,6 +41,7 @@
 #include <QtLogging>
 
 #include "flat_layout_scraper.hh"
+#include "global_sym_scraper.hh"
 #include "pool.hh"
 #include "scraper.hh"
 #include "utils.hh"
@@ -53,7 +54,7 @@ namespace {
  * Maps command line arguments to an internal identifier for
  * a specific scraper.
  */
-enum class ScraperID { FlatLayout, Unset };
+enum class ScraperID { FlatLayout, GlobalSym, Unset };
 
 /**
  * Log stream, can be a file or stderr.
@@ -66,10 +67,23 @@ std::ostream &operator<<(std::ostream &os, const ScraperID &value) {
   case ScraperID::FlatLayout:
     os << "flat-layout";
     break;
+  case ScraperID::GlobalSym:
+    os << "global-sym";
+    break;
   default:
     os << "<unknown-scraper>";
   }
   return os;
+}
+
+template <typename T> ScraperID scraperNameToID(const T &name) {
+  if (name == "flat-layout") {
+    return ScraperID::FlatLayout;
+  } else if (name == "global-sym") {
+    return ScraperID::GlobalSym;
+  } else {
+    return ScraperID::Unset;
+  }
 }
 
 void logHandler(QtMsgType type, const QMessageLogContext &context,
@@ -97,6 +111,10 @@ public:
     case ScraperID::FlatLayout:
       scraper =
           std::make_unique<cheri::FlatLayoutScraper>(sm_, std::move(source));
+      break;
+    case ScraperID::GlobalSym:
+      scraper =
+          std::make_unique<cheri::GlobalSymScraper>(sm_, std::move(source));
       break;
     default:
       qCritical() << "Unexpected scraper ID";
@@ -183,7 +201,8 @@ int main(int argc, char **argv) {
   parser.addOption(read_stdin);
 
   parser.addPositionalArgument(
-      "scraper", "Select scraper to run. Valid values are 'flat-layout'");
+      "scraper",
+      "Select scraper to run. Valid values are 'flat-layout', 'global-sym'");
 
   parser.process(app);
 
@@ -213,14 +232,11 @@ int main(int argc, char **argv) {
     parser.showHelp(1);
   }
   auto scraper_name = args.at(0);
-  ScraperID scraper_id = ScraperID::Unset;
-  if (scraper_name == "flat-layout") {
-    scraper_id = ScraperID::FlatLayout;
-  }
+  ScraperID scraper_id = scraperNameToID(scraper_name);
   if (scraper_id == ScraperID::Unset) {
     qCritical() << "Invalid scraper name '" << scraper_name << "'"
-                << "Must be one of {'flat-layout'}";
-    parser.showHelp(1);
+                << "Must be one of {'flat-layout', 'global-sym'}";
+    parser.showHelp(/*exitCode=*/1);
   }
 
   bool ok;

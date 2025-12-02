@@ -58,6 +58,7 @@ class StorageManager {
 public:
   StorageManager(std::filesystem::path db_path);
   StorageManager(const StorageManager &s) = delete;
+  ~StorageManager();
 
   /**
    * Get the database connection instance for the current worker thread.
