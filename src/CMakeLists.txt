@@ -14,7 +14,7 @@ llvm_map_components_to_libnames(llvm_libs
   Support)
 separate_arguments(LLVM_DEFINITIONS_LIST NATIVE_COMMAND ${LLVM_DEFINITIONS})
 
-find_package(Qt6 REQUIRED COMPONENTS Core Sql)
+find_package(Qt6 6.6 REQUIRED COMPONENTS Core Sql)
 qt_standard_project_setup()
 
 add_library(dwarf_scraper_lib
