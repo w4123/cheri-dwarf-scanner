@@ -14,4 +14,9 @@ struct struct_with_size1_vla {
   int vla[1];
 } c;
 
+struct struct_no_vla {
+  int value;
+  int not_vla[2];
+} d;
+
 int main() { return (0); }

@@ -77,6 +77,14 @@ TEST_F(TestStorage, TestExtractStructVLA) {
     EXPECT_EQ(q_vla.value("name").toString(), "struct_with_size1_vla::vla");
     EXPECT_TRUE(q_vla.value("is_vla").toBool());
   }
+
+  {
+    auto q_count = sm_->query(
+        "SELECT COUNT(*) as row_count FROM layout_member WHERE is_vla = 1");
+    EXPECT_FALSE(q_count.lastError().isValid());
+    EXPECT_TRUE(q_count.seek(0));
+    EXPECT_EQ(q_count.value("row_count"), 3);
+  }
 }
 
 TEST_F(TestStorage, TestExtractNestedVLA) {
