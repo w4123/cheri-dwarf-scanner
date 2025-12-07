@@ -114,7 +114,7 @@ struct FlattenedLayout {
   uint64_t die_offset;
   // Members as part of the flattened layout
   // Direct member information
-  std::vector<LayoutMember> members;
+  std::vector<std::unique_ptr<LayoutMember>> members;
   // Does the layout include a VLA?
   bool has_vla;
 };

@@ -318,7 +318,7 @@ LayoutMember *FlatLayoutScraper::visitNested(const llvm::DWARFDie &die,
     throw ScraperError("Not implemented");
   }
 
-  LayoutMember m;
+  auto m = std::make_unique<LayoutMember>();
   auto member_type_die = die.getAttributeValueAsReferencedDie(dwarf::DW_AT_type)
                              .resolveTypeUnitReference();
 
@@ -329,20 +329,20 @@ LayoutMember *FlatLayoutScraper::visitNested(const llvm::DWARFDie &die,
     // Anonymous member, use member index to generate unique name
     member_name = std::format("_anon{}", mindex);
   }
-  m.name = std::format("{}::{}", prefix, member_name);
+  m->name = std::format("{}::{}", prefix, member_name);
 
   // Relay type information into the member
   TypeDesc member_desc = resolveTypeDie(member_type_die);
-  m.type_name = member_desc.name;
-  m.byte_size = member_desc.byte_size;
+  m->type_name = member_desc.name;
+  m->byte_size = member_desc.byte_size;
   auto tag_bit_size = getULongAttr(die, dwarf::DW_AT_bit_size).value_or(0);
-  if (tag_bit_size > std::numeric_limits<decltype(m.bit_size)>::max()) {
+  if (tag_bit_size > std::numeric_limits<decltype(m->bit_size)>::max()) {
     qCritical() << "Found DW_AT_bit_size overflowing uint8_t";
     throw ScraperError("Not implemented");
   }
-  m.bit_size = static_cast<decltype(m.bit_size)>(tag_bit_size);
+  m->bit_size = static_cast<decltype(m->bit_size)>(tag_bit_size);
 
-  m.byte_offset = parent_offset;
+  m->byte_offset = parent_offset;
   auto tag_offset = getULongAttr(die, dwarf::DW_AT_data_member_location);
   auto tag_bit_offset = getULongAttr(die, dwarf::DW_AT_data_bit_offset);
   // Old-style bit offset deprecated in DWARF v5.
@@ -357,43 +357,45 @@ LayoutMember *FlatLayoutScraper::visitNested(const llvm::DWARFDie &die,
   unsigned long bit_offset = 0;
   if (tag_old_bit_offset) {
     if (source().getContext().isLittleEndian()) {
-      auto shift = *tag_old_bit_offset + m.bit_size;
-      bit_offset = m.byte_size * 8 - shift;
+      auto shift = *tag_old_bit_offset + m->bit_size;
+      bit_offset = m->byte_size * 8 - shift;
     } else {
       bit_offset = *tag_old_bit_offset;
     }
   } else if (tag_bit_offset) {
     bit_offset = *tag_bit_offset;
   }
-  m.bit_offset = bit_offset;
-  m.byte_offset += tag_offset.value_or(0);
-  m.array_items = member_desc.array_count;
+  m->bit_offset = bit_offset;
+  m->byte_offset += tag_offset.value_or(0);
+  m->array_items = member_desc.array_count;
 
   if (member_desc.pointer) {
-    m.is_pointer = true;
+    m->is_pointer = true;
     if (*member_desc.pointer == PointerKind::Function) {
-      m.is_function = true;
+      m->is_function = true;
     }
   }
 
   // Determine bounds
-  uint64_t rlen = m.byte_size + (m.bit_size ? 1 : 0);
-  auto [base, length] = source().findRepresentableRange(m.byte_offset, rlen);
-  m.base = base;
-  m.top = base + length;
-  m.required_precision = source().findRequiredPrecision(m.byte_offset, rlen);
-  m.is_imprecise = m.byte_offset != m.base || length != rlen;
+  uint64_t rlen = m->byte_size + (m->bit_size ? 1 : 0);
+  auto [base, length] = source().findRepresentableRange(m->byte_offset, rlen);
+  m->base = base;
+  m->top = base + length;
+  m->required_precision = source().findRequiredPrecision(m->byte_offset, rlen);
+  m->is_imprecise = m->byte_offset != m->base || length != rlen;
 
   qDebug() << "Traversed member"
            << std::format("+{:#x}:{} {} {} ({:#x}) -> [{:#x}, {:#x}] {}",
-                          m.byte_offset, m.bit_offset, m.type_name, m.name,
-                          rlen, m.base, m.top, m.is_imprecise ? "I" : "P");
+                          m->byte_offset, m->bit_offset, m->type_name, m->name,
+                          rlen, m->base, m->top, m->is_imprecise ? "I" : "P");
 
-  LayoutMember &mref = layout->members.emplace_back(std::move(m));
+  // Keep the member pointer for later updates, maybe use shared_ptr?
+  LayoutMember *mp = m.get();
+  layout->members.emplace_back(std::move(m));
   if (member_desc.decl) {
     auto decl = *member_desc.decl;
     if (decl.kind == DeclKind::Union) {
-      mref.is_union = true;
+      mp->is_union = true;
     }
 
     if (decl.kind != DeclKind::Enum) {
@@ -404,17 +406,17 @@ LayoutMember *FlatLayoutScraper::visitNested(const llvm::DWARFDie &die,
       for (auto &child : decl.type_die.children()) {
         if (child.getTag() == dwarf::DW_TAG_member) {
           last_member = visitNested(child, layout, prefix, member_index++,
-                                    mref.byte_offset);
-          if (mref.is_union)
+                                    mp->byte_offset);
+          if (mp->is_union)
             checkVLAMember(layout, last_member);
         }
       }
-      if (!mref.is_union)
+      if (!mp->is_union)
         checkVLAMember(layout, last_member);
     }
   }
 
-  return &mref;
+  return mp;
 }
 
 void FlatLayoutScraper::checkVLAMember(FlattenedLayout *layout,
@@ -422,7 +424,7 @@ void FlatLayoutScraper::checkVLAMember(FlattenedLayout *layout,
   if (member == nullptr)
     return;
 
-  if (member->array_items && *member->array_items <= 1) {
+  if (member->array_items && member->array_items.value() <= 1) {
     member->is_vla = true;
     layout->has_vla = true;
     qDebug() << "Mark VLA member"
@@ -497,27 +499,28 @@ void FlatLayoutScraper::recordLayout(std::unique_ptr<FlattenedLayout> layout) {
 
     for (auto &m : layout->members) {
       insert_member.bindValue(":owner", layout_id);
-      insert_member.bindValue(":name", QString::fromStdString(m.name));
+      insert_member.bindValue(":name", QString::fromStdString(m->name));
       insert_member.bindValue(":type_name",
-                              QString::fromStdString(m.type_name));
-      insert_member.bindValue(":byte_offset", m.byte_offset);
-      insert_member.bindValue(":bit_offset", m.bit_offset);
-      insert_member.bindValue(":byte_size", m.byte_size);
-      insert_member.bindValue(":bit_size", m.bit_size);
-      if (m.array_items) {
-        insert_member.bindValue(":array_items", *m.array_items);
+                              QString::fromStdString(m->type_name));
+      insert_member.bindValue(":byte_offset", m->byte_offset);
+      insert_member.bindValue(":bit_offset", m->bit_offset);
+      insert_member.bindValue(":byte_size", m->byte_size);
+      insert_member.bindValue(":bit_size", m->bit_size);
+      if (m->array_items) {
+        insert_member.bindValue(":array_items", *m->array_items);
       } else {
         insert_member.bindValue(":array_items", QVariant::fromValue(nullptr));
       }
-      insert_member.bindValue(":base", static_cast<unsigned long long>(m.base));
-      insert_member.bindValue(":top", static_cast<unsigned long long>(m.top));
-      insert_member.bindValue(":required_precision", m.required_precision);
-      insert_member.bindValue(":is_pointer", m.is_pointer);
-      insert_member.bindValue(":is_function", m.is_function);
-      insert_member.bindValue(":is_anon", m.is_anon);
-      insert_member.bindValue(":is_union", m.is_union);
-      insert_member.bindValue(":is_imprecise", m.is_imprecise);
-      insert_member.bindValue(":is_vla", m.is_vla);
+      insert_member.bindValue(":base",
+                              static_cast<unsigned long long>(m->base));
+      insert_member.bindValue(":top", static_cast<unsigned long long>(m->top));
+      insert_member.bindValue(":required_precision", m->required_precision);
+      insert_member.bindValue(":is_pointer", m->is_pointer);
+      insert_member.bindValue(":is_function", m->is_function);
+      insert_member.bindValue(":is_anon", m->is_anon);
+      insert_member.bindValue(":is_union", m->is_union);
+      insert_member.bindValue(":is_imprecise", m->is_imprecise);
+      insert_member.bindValue(":is_vla", m->is_vla);
       if (!insert_member.exec()) {
         // Failed, abort the transaction
         qCritical() << "Failed to insert layout member:"
