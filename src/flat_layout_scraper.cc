@@ -88,6 +88,9 @@ void FlatLayoutScraper::initSchema() {
             "name TEXT NOT NULL,"
             // Size of the strucutre including any padding
             "size INTEGER NOT NULL,"
+            "total_padding INTEGER NOT NULL,"
+            "has_extra_padding INTEGER DEFAULT 0 NOT NULL"
+            " CHECK (has_extra_padding >= 0 AND has_extra_padding <= 1),"
             // Whether the type is a struct, union or not
             "is_union INTEGER DEFAULT 0 NOT NULL"
             " CHECK(is_union >= 0 AND is_union <= 1),"
@@ -107,9 +110,10 @@ void FlatLayoutScraper::initSchema() {
             "bit_size INTEGER DEFAULT 0 NOT NULL,"
             "byte_offset INTEGER NOT NULL,"
             "bit_offset INTEGER DEFAULT 0 NOT NULL,"
+            "alignment INTEGER DEFAULT 0 NOT NULL,"
             "array_items INTEGER,"
-            "base INTEGER,"
-            "top INTEGER,"
+            "base TEXT,"
+            "top TEXT,"
             "required_precision INTEGER,"
             "max_vla_size INTEGER,"
             "is_pointer INTEGER DEFAULT 0 NOT NULL"
@@ -120,7 +124,7 @@ void FlatLayoutScraper::initSchema() {
             " CHECK(is_anon >= 0 AND is_anon <= 1),"
             "is_union INTEGER DEFAULT 0 NOT NULL"
             " CHECK(is_union >= 0 AND is_union <= 1),"
-            "is_imprecise INTEGER DEFAULT 0 NOT NULL"
+            "is_imprecise INTEGER NOT NULL"
             " CHECK(is_imprecise >= 0 AND is_imprecise <= 1),"
             "FOREIGN KEY (owner) REFERENCES type_layout (id),"
             "UNIQUE(owner, name, byte_offset, bit_offset))");
@@ -282,9 +286,9 @@ FlatLayoutScraper::visitCommon(const llvm::DWARFDie &die,
   long member_index = 0;
   LayoutMember *last_member = nullptr;
   for (auto &child : die.children()) {
-    if (child.getTag() == dwarf::DW_TAG_member) {
+    if (child.getTag() == dwarf::DW_TAG_member || child.getTag() == dwarf::DW_TAG_inheritance) {
       last_member = visitNested(child, layout.get(), td.name, member_index++,
-                                /*offset=*/0);
+                                /*offset=*/0, /*depth=*/0);
       if (is_union)
         checkVLAMember(layout.get(), last_member);
     }
@@ -306,7 +310,7 @@ FlatLayoutScraper::visitCommon(const llvm::DWARFDie &die,
 LayoutMember *FlatLayoutScraper::visitNested(const llvm::DWARFDie &die,
                                              FlattenedLayout *layout,
                                              std::string prefix, long mindex,
-                                             unsigned long parent_offset) {
+                                             unsigned long parent_offset, uint64_t depth) {
   /* Skip declarations, we don't care. */
   if (die.find(dwarf::DW_AT_declaration)) {
     return nullptr;
@@ -364,9 +368,13 @@ LayoutMember *FlatLayoutScraper::visitNested(const llvm::DWARFDie &die,
   } else if (tag_bit_offset) {
     bit_offset = *tag_bit_offset;
   }
+
   m->bit_offset = bit_offset;
   m->byte_offset += tag_offset.value_or(0);
+
   m->array_items = member_desc.array_count;
+
+  auto alignment = getULongAttr(die, dwarf::DW_AT_alignment).value_or(0);
 
   if (member_desc.pointer) {
     m->is_pointer = true;
@@ -376,18 +384,22 @@ LayoutMember *FlatLayoutScraper::visitNested(const llvm::DWARFDie &die,
   }
 
   // Determine bounds
+  // Is this really correct?
   uint64_t rlen = m->byte_size + (m->bit_size ? 1 : 0);
   auto [base, length] = source().findRepresentableRange(m->byte_offset, rlen);
   m->base = base;
   m->top = base + length;
   m->required_precision = source().findRequiredPrecision(m->byte_offset, rlen);
-  m->is_imprecise = m->byte_offset != m->base || length != rlen;
+  m->is_imprecise = (m->byte_offset != m->base) || (length != rlen);
+  m->depth = depth;
 
   qDebug() << "Traversed member"
            << std::format("+{:#x}:{} {} {} ({:#x}) -> [{:#x}, {:#x}] {}",
                           m->byte_offset, m->bit_offset, m->type_name, m->name,
                           rlen, m->base, m->top, m->is_imprecise ? "I" : "P");
 
+  // Max alignment of all members
+  uint64_t struct_alignment = 0;
   // Keep the member pointer for later updates, maybe use shared_ptr?
   LayoutMember *mp = m.get();
   layout->members.emplace_back(std::move(m));
@@ -403,9 +415,11 @@ LayoutMember *FlatLayoutScraper::visitNested(const llvm::DWARFDie &die,
       LayoutMember *last_member = nullptr;
       prefix += "::" + member_name;
       for (auto &child : decl.type_die.children()) {
-        if (child.getTag() == dwarf::DW_TAG_member) {
+        if (child.getTag() == dwarf::DW_TAG_member || child.getTag() == dwarf::DW_TAG_inheritance) {
           last_member = visitNested(child, layout, prefix, member_index++,
-                                    mp->byte_offset);
+                                    mp->byte_offset, depth + 1);
+          if (last_member)
+            struct_alignment = std::max(struct_alignment, last_member->alignment);
           if (mp->is_union)
             checkVLAMember(layout, last_member);
         }
@@ -414,6 +428,19 @@ LayoutMember *FlatLayoutScraper::visitNested(const llvm::DWARFDie &die,
         checkVLAMember(layout, last_member);
     }
   }
+
+  if (alignment == 0) {
+    if (struct_alignment) {
+      alignment = struct_alignment;
+    } else if (member_desc.array_count && member_desc.array_count.value()) {
+      assert(member_desc.byte_size % member_desc.array_count.value() == 0);
+      alignment = member_desc.byte_size / member_desc.array_count.value();
+    } else {
+      alignment = member_desc.byte_size;
+    }
+  }
+
+  mp->alignment = alignment;
 
   return mp;
 }
@@ -436,11 +463,46 @@ void FlatLayoutScraper::checkVLAMember(FlattenedLayout *layout,
 void FlatLayoutScraper::recordLayout(std::unique_ptr<FlattenedLayout> layout) {
   sm_.transaction([&](StorageManager &sm) {
     qDebug() << "Transaction for" << layout->name;
+    
+    // Calculate padding here
+    std::vector<std::tuple<uint64_t, uint64_t, uint64_t>> occupied_bytes;
+    uint64_t total_padding = 0;
+    bool has_extra_padding = false;
+    if (layout->kind != LayoutKind::Union) {
+      for (auto &m : layout->members) {
+        if (m->depth != 0) continue;
+        auto actual_start = m->byte_offset + m->bit_offset / 8;
+        auto actual_end = std::max(m->byte_offset + m->byte_size, m->byte_offset + (m->bit_offset + m->bit_size + 7) / 8);
+        occupied_bytes.emplace_back(actual_start, actual_end, m->alignment);
+      }
 
+      std::sort(occupied_bytes.begin(), occupied_bytes.end());
+
+      uint64_t struct_align = 0;
+      uint64_t last_end = 0;
+      for (auto&& [start, end, align] : occupied_bytes) {
+        if (start > last_end) {
+          auto padding = start - last_end;
+          total_padding += padding;
+          if (align && padding >= align) {
+            has_extra_padding = true;
+          }
+        }
+        last_end = end;
+        struct_align = std::max(struct_align, align);
+      } 
+
+      auto end_padding = layout->size - last_end;
+      total_padding += end_padding;
+      if (struct_align && end_padding >= struct_align) {
+        has_extra_padding = true;
+      }
+    }
+   
     // clang-format off
     auto insert_layout = sm.prepare(
-        "INSERT INTO type_layout (name, file, line, size, is_union, has_vla) "
-        "VALUES (:name, :file, :line, :size, :is_union, :has_vla) "
+        "INSERT INTO type_layout (name, file, line, size, is_union, has_vla, total_padding, has_extra_padding) "
+        "VALUES (:name, :file, :line, :size, :is_union, :has_vla, :total_padding, :has_extra_padding) "
         "ON CONFLICT DO NOTHING RETURNING id");
 
     auto fetch_layout = sm.prepare(
@@ -450,14 +512,14 @@ void FlatLayoutScraper::recordLayout(std::unique_ptr<FlattenedLayout> layout) {
     auto insert_member = sm.prepare(
         "INSERT INTO layout_member ("
         "owner, name, type_name, byte_offset, bit_offset, "
-        "byte_size, bit_size, array_items, "
+        "byte_size, bit_size, array_items, alignment, "
         "base, top, required_precision, max_vla_size, "
-        "is_pointer, is_function, is_anon, is_union"
+        "is_pointer, is_function, is_anon, is_union, is_imprecise"
         ") VALUES ("
         ":owner, :name, :type_name, :byte_offset, :bit_offset, "
-        ":byte_size, :bit_size, :array_items, "
+        ":byte_size, :bit_size, :array_items, :alignment, "
         ":base, :top, :required_precision, :max_vla_size, "
-        ":is_pointer, :is_function, :is_anon, :is_union"
+        ":is_pointer, :is_function, :is_anon, :is_union, :is_imprecise"
         ") ON CONFLICT DO NOTHING RETURNING id");
     // clang-format on
 
@@ -471,6 +533,8 @@ void FlatLayoutScraper::recordLayout(std::unique_ptr<FlattenedLayout> layout) {
       insert_layout.bindValue(":is_union", 0ULL);
     }
     insert_layout.bindValue(":has_vla", layout->has_vla);
+    insert_layout.bindValue(":total_padding", (unsigned long long)total_padding);
+    insert_layout.bindValue(":has_extra_padding", (unsigned long long)has_extra_padding);
     if (!insert_layout.exec()) {
       // Failed, abort the transaction
       qCritical() << "Failed to insert layout:" << insert_layout.lastQuery();
@@ -512,9 +576,9 @@ void FlatLayoutScraper::recordLayout(std::unique_ptr<FlattenedLayout> layout) {
       } else {
         insert_member.bindValue(":array_items", QVariant::fromValue(nullptr));
       }
-      insert_member.bindValue(":base",
-                              static_cast<unsigned long long>(m->base));
-      insert_member.bindValue(":top", static_cast<unsigned long long>(m->top));
+      insert_member.bindValue(":alignment", (unsigned long long)m->alignment);
+      insert_member.bindValue(":base", QString::fromStdString(std::to_string(m->base)));
+      insert_member.bindValue(":top",  QString::fromStdString(std::to_string(m->top)));
       insert_member.bindValue(":required_precision", m->required_precision);
       if (m->max_vla_size) {
         insert_member.bindValue(":max_vla_size", *m->max_vla_size);
@@ -525,6 +589,7 @@ void FlatLayoutScraper::recordLayout(std::unique_ptr<FlattenedLayout> layout) {
       insert_member.bindValue(":is_function", m->is_function);
       insert_member.bindValue(":is_anon", m->is_anon);
       insert_member.bindValue(":is_union", m->is_union);
+      insert_member.bindValue(":is_imprecise", m->is_imprecise);
       if (!insert_member.exec()) {
         // Failed, abort the transaction
         qCritical() << "Failed to insert layout member:"

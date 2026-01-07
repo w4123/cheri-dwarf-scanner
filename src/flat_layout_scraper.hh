@@ -45,7 +45,7 @@ enum class LayoutKind {
  */
 struct LayoutMember {
   LayoutMember()
-      : byte_size(0), bit_size(0), byte_offset(0), bit_offset(0),
+      : byte_size(0), bit_size(0), byte_offset(0), bit_offset(0), alignment(0), depth(0),
         is_pointer(false), is_function(false), is_anon(false), is_union(false),
         is_imprecise(false), base(0), top(0), required_precision(0) {}
 
@@ -60,10 +60,15 @@ struct LayoutMember {
   // Offset from the start of the layout
   unsigned long long byte_offset;
   // Fractional bit remainder of the size
-  uint8_t bit_offset;
+  // This can be >= 2**8
+  unsigned long long bit_offset;
   // Number of array items, if the field is an array
   // this will be 0 if the array is a flexible array.
   std::optional<unsigned long long> array_items;
+  // Alignment in bytes
+  uint64_t alignment;
+  // Depth of member
+  uint64_t depth;
   // Flags used to mark member properties
   bool is_pointer : 1;
   bool is_function : 1;
@@ -162,7 +167,7 @@ protected:
    */
   LayoutMember *visitNested(const llvm::DWARFDie &die, FlattenedLayout *layout,
                             std::string prefix, long mindex,
-                            unsigned long offset);
+                            unsigned long offset, uint64_t depth);
 
   /**
    * Check whether the given member is a VLA and mark the layout accordingly.

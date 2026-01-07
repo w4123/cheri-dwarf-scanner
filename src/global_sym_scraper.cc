@@ -175,7 +175,18 @@ bool GlobalSymScraper::visit_variable(llvm::DWARFDie &die) {
   info.file = die.getDeclFile(FLIKind::AbsoluteFilePath);
   info.line = die.getDeclLine();
 
-  auto type_die = die.getAttributeValueAsReferencedDie(dwarf::DW_AT_type)
+  llvm::DWARFDie def = die;
+  constexpr int kMaxFollow = 8;
+  for (int i = 0; i < kMaxFollow && def.isValid(); i++) {
+    if (def.find(dwarf::DW_AT_type)) break;
+    if (auto spec = def.getAttributeValueAsReferencedDie(dwarf::DW_AT_specification);
+        spec.isValid()) { def = spec; continue; }
+    if (auto ao = def.getAttributeValueAsReferencedDie(dwarf::DW_AT_abstract_origin);
+        ao.isValid()) { def = ao; continue; }
+    break;
+  }
+
+  auto type_die = def.getAttributeValueAsReferencedDie(dwarf::DW_AT_type)
                       .resolveTypeUnitReference();
   TypeDesc desc = resolveTypeDie(type_die);
   info.size = desc.byte_size;
