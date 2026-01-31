@@ -77,8 +77,16 @@ TypeDecl::TypeDecl(const llvm::DWARFDie &die) : type_die(die), line(0) {
 void FlatLayoutScraper::initSchema() {
   // clang-format off
   /* Attempt to initialize tables */
+  sm_.query("CREATE TABLE IF NOT EXISTS binary ("
+            "id INTEGER PRIMARY KEY,"
+            // The executable file
+            "file TEXT NOT NULL,"
+            "UNIQUE(file))");
+
   sm_.query("CREATE TABLE IF NOT EXISTS type_layout ("
             "id INTEGER PRIMARY KEY,"
+            // Binary ID where the struct is found
+            "binary_id INTEGER NOT NULL,"
             // File where the struct is defined
             "file TEXT NOT NULL,"
             // Line where the struct is defined
@@ -97,7 +105,8 @@ void FlatLayoutScraper::initSchema() {
             // Does the structure contain a VLA
             "has_vla INTEGER DEFAULT 0 NOT NULL"
             " CHECK(has_vla >= 0 AND has_vla <= 1),"
-            "UNIQUE(name, file, line, size))");
+            "FOREIGN KEY (binary_id) REFERENCES binary (id),"
+            "UNIQUE(binary_id, name, file, line, size))");
 
   sm_.query("CREATE TABLE IF NOT EXISTS layout_member ("
             "id INTEGER PRIMARY KEY,"
@@ -500,14 +509,22 @@ void FlatLayoutScraper::recordLayout(std::unique_ptr<FlattenedLayout> layout) {
     }
    
     // clang-format off
+    auto insert_binary = sm.prepare(
+        "INSERT INTO binary (file) VALUES (:file)"
+        "ON CONFLICT DO NOTHING RETURNING id");
+
+    auto fetch_binary = sm.prepare(
+        "SELECT id FROM binary WHERE "
+        "file = :file");
+
     auto insert_layout = sm.prepare(
-        "INSERT INTO type_layout (name, file, line, size, is_union, has_vla, total_padding, has_extra_padding) "
-        "VALUES (:name, :file, :line, :size, :is_union, :has_vla, :total_padding, :has_extra_padding) "
+        "INSERT INTO type_layout (binary_id, name, file, line, size, is_union, has_vla, total_padding, has_extra_padding) "
+        "VALUES (:binary_id, :name, :file, :line, :size, :is_union, :has_vla, :total_padding, :has_extra_padding) "
         "ON CONFLICT DO NOTHING RETURNING id");
 
     auto fetch_layout = sm.prepare(
         "SELECT id FROM type_layout WHERE "
-        "name = :name AND file = :file AND line = :line AND size = :size");
+        "binary_id = :binary_id AND name = :name AND file = :file AND line = :line AND size = :size");
 
     auto insert_member = sm.prepare(
         "INSERT INTO layout_member ("
@@ -523,6 +540,32 @@ void FlatLayoutScraper::recordLayout(std::unique_ptr<FlattenedLayout> layout) {
         ") ON CONFLICT DO NOTHING RETURNING id");
     // clang-format on
 
+    insert_binary.bindValue(":file", QString::fromStdString(source().getPath().string()));
+    if (!insert_binary.exec()) {
+      // Failed, abort the transaction
+      qCritical() << "Failed to insert binary:" << insert_binary.lastQuery();
+      throw DBError(insert_binary.lastError());
+    }
+    QVariant binary_id;
+    if (!insert_binary.first()) {
+      fetch_binary.bindValue(":file", QString::fromStdString(source().getPath().string()));
+      if (!fetch_binary.exec()) {
+        qCritical() << "Failed to fetch binary ID:"
+                    << fetch_binary.lastQuery();
+        throw DBError(fetch_binary.lastError());
+      }
+      if (!fetch_binary.first()) {
+        qCritical() << "Binary record could not be found";
+        throw ScraperError("Unexpected missing binary");
+      }
+      binary_id = fetch_binary.value(0);
+      fetch_binary.finish();
+    } else {
+      binary_id = insert_binary.value(0);
+    }
+    insert_binary.finish();
+
+    insert_layout.bindValue(":binary_id", binary_id);
     insert_layout.bindValue(":name", QString::fromStdString(layout->name));
     insert_layout.bindValue(":file", QString::fromStdString(layout->file));
     insert_layout.bindValue(":line", layout->line);
@@ -542,6 +585,7 @@ void FlatLayoutScraper::recordLayout(std::unique_ptr<FlattenedLayout> layout) {
     }
     QVariant layout_id;
     if (!insert_layout.first()) {
+      fetch_layout.bindValue(":binary_id", binary_id);
       fetch_layout.bindValue(":name", QString::fromStdString(layout->name));
       fetch_layout.bindValue(":file", QString::fromStdString(layout->file));
       fetch_layout.bindValue(":line", layout->line);

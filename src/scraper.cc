@@ -382,7 +382,8 @@ TypeDesc DwarfScraper::resolveTypeDie(const llvm::DWARFDie &die) {
     case dwarf::DW_TAG_rvalue_reference_type:
       desc.pointer = PointerKind::Reference;
       /* fallthrough */
-    case dwarf::DW_TAG_pointer_type: {
+    case dwarf::DW_TAG_pointer_type:
+    case dwarf::DW_TAG_ptr_to_member_type: {
       auto size = getULongAttr(iter_die, dwarf::DW_AT_byte_size)
                       .value_or(source().getABIPointerSize());
       if (!byte_size)
